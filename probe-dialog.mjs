@@ -1,0 +1,10 @@
+import { chromium } from 'playwright'
+const browser = await chromium.launch({ channel: 'chrome', headless: true })
+const page = await browser.newPage({ viewport: { width: 1440, height: 900 } })
+await page.goto('http://localhost:19006', { waitUntil: 'networkidle', timeout: 120000 })
+await page.waitForTimeout(6000)
+await page.screenshot({ path: '/tmp/probe-dialog.png' })
+const dlg = await page.locator('[role="dialog"]').first()
+console.log('dialog visible:', await dlg.isVisible().catch(() => false))
+console.log('dialog text:', (await dlg.innerText().catch(() => '')).slice(0, 500))
+await browser.close()

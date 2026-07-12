@@ -1,0 +1,9 @@
+node_modules/
+.DS_Store
+
+# 런타임 데이터 — 커밋 금지
+accounts.json
+media/
+
+# 세션 임시 파일
+*.log
