@@ -790,27 +790,43 @@ function tidNow() {
   return s
 }
 
-async function submitPostOnChain(acct, text, parentId, media) {
+async function submitPostOnChain(acct, text, parentId, media, paywallGeunhwa) {
+  // 페이월 가격은 서버가 재검증 (클라이언트 값 신뢰 금지): 0.01~100 HANEUL
+  const paywall =
+    Number.isFinite(Number(paywallGeunhwa)) &&
+    Number(paywallGeunhwa) >= 10_000_000 &&
+    Number(paywallGeunhwa) <= 100_000_000_000
+      ? Math.floor(Number(paywallGeunhwa))
+      : null
   return serialized(async () => {
     await exec(CLI, ['client', 'switch', '--address', acct.address])
-    const { stdout } = await exec(
-      CLI,
-      [
-        'client', 'ptb',
-        '--move-call', `${PKG}::feed::request_create_post`,
-        `@${FEED}`, `"${encodeContent(text, media)}"`,
-        parentId != null ? `some(${parentId})` : 'none', 'none', 'none',
-        '--assign', 'r',
-        '--move-call', `${PKG}::feed::execute_create_post`,
-        `@${FEED}`, `@${RULES}`, 'r.0', 'r.1', '@0x6',
-        '--gas-budget', '50000000',
-      ],
-      { maxBuffer: 16 * 1024 * 1024 },
-    )
+    const args = [
+      'client', 'ptb',
+      '--move-call', `${PKG}::feed::request_create_post`,
+      `@${FEED}`, `"${encodeContent(text, media)}"`,
+      parentId != null ? `some(${parentId})` : 'none', 'none', 'none',
+      '--assign', 'r',
+      '--move-call', `${PKG}::feed::execute_create_post`,
+      `@${FEED}`, `@${RULES}`, 'r.0', 'r.1', '@0x6',
+    ]
+    // 글 작성과 페이월 생성을 한 tx로 원자 확정 — 가격 없는 유료 글이 생길 틈이 없음
+    if (paywall) {
+      args.push(
+        '--assign', 'pid',
+        '--move-call', `${PKG}::paid_posts::create<${HANEUL_TYPE}>`,
+        `@${FEED}`, 'pid', `${paywall}`,
+      )
+    }
+    args.push('--gas-budget', '50000000')
+    const { stdout } = await exec(CLI, args, { maxBuffer: 16 * 1024 * 1024 })
     const digest = /Transaction Digest: (\S+)/.exec(stdout)?.[1]
     const postId = /post_id\s*│\s*(\d+)/.exec(stdout)?.[1]
     if (!postId) throw new Error(`PostCreated 이벤트 미발견 (tx: ${digest ?? '없음'})`)
-    console.log(`⛓️  쓰기: post_id=${postId} by ${acct.handle} tx=${digest}`)
+    if (paywall && !/PaywallCreated/.test(stdout))
+      throw new Error(`페이월 생성 실패 (tx: ${digest})`)
+    console.log(
+      `⛓️  쓰기: post_id=${postId} by ${acct.handle}${paywall ? ` [유료 ${paywall / 1e9} HANEUL]` : ''} tx=${digest}`,
+    )
     return { postId, digest }
   })
 }
@@ -891,7 +907,7 @@ xrpc('post', 'com.atproto.repo.applyWrites', async req => {
     if (isCreate && w.collection === 'app.bsky.feed.post') {
       const parentId = parentIdFromUri(w.value?.reply?.parent?.uri)
       const media = mediaFromEmbed(w.value?.embed)
-      const { postId, digest } = await submitPostOnChain(acct, w.value?.text, parentId, media)
+      const { postId, digest } = await submitPostOnChain(acct, w.value?.text, parentId, media, w.value?.humming?.paywallGeunhwa)
       results.push({
         $type: 'com.atproto.repo.applyWrites#createResult',
         uri: `at://${acct.did}/app.bsky.feed.post/${postId}`,
@@ -921,7 +937,7 @@ xrpc('post', 'com.atproto.repo.createRecord', async req => {
   if (collection === 'app.bsky.feed.post') {
     const parentId = parentIdFromUri(record?.reply?.parent?.uri)
     const media = mediaFromEmbed(record?.embed)
-    const { postId, digest } = await submitPostOnChain(acct, record?.text, parentId, media)
+    const { postId, digest } = await submitPostOnChain(acct, record?.text, parentId, media, record?.humming?.paywallGeunhwa)
     return {
       uri: `at://${acct.did}/app.bsky.feed.post/${postId}`,
       cid: await fakeCid(digest),
@@ -1112,6 +1128,124 @@ xrpc('post', 'app.humming.monetization.tip', async req => {
   })
   console.log(`💰 팁: ${viewer.handle} → ${creator.handle}${postId ? ` (post ${postId})` : ''} (${amount / 1e9} HANEUL) tx=${digest}`)
   return { digest, amountGeunhwa: amount }
+})
+
+// 크리에이터 되기: 티어 생성(+선택적 프로필 잠금)을 본인 지갑 서명으로 온체인 확정.
+// KYC는 의도적 오프체인(신분증을 퍼블릭 체인에 못 올림) — 데모에서는 즉시 통과 스텁,
+// 통과 사실만 verified 배지로 반영. 실서비스에서는 외부 KYC 벤더 콜백이 이 자리에 들어옴.
+xrpc('post', 'app.humming.creator.becomeCreator', async req => {
+  const viewer = requireAuthAcct(req)
+  const price = Math.floor(Number(req.body.priceGeunhwa))
+  const periodDays = Math.floor(Number(req.body.periodDays ?? 30))
+  const lockMode = String(req.body.lockMode ?? 'open') // open | tease | lock
+  const fail = (status, message) => {
+    const e = new Error(message)
+    e.status = status
+    throw e
+  }
+  // 가드레일: 0.01 ~ 100 HANEUL / 1~365일
+  if (!(price >= 10_000_000 && price <= 100_000_000_000)) fail(400, '구독료는 0.01~100 HANEUL 사이여야 합니다')
+  if (!(periodDays >= 1 && periodDays <= 365)) fail(400, '구독 기간은 1~365일 사이여야 합니다')
+  if (!['open', 'tease', 'lock'].includes(lockMode)) fail(400, 'lockMode는 open/tease/lock 중 하나입니다')
+  const gate = await loadGateState()
+  if (gate.tierByCreator.has(viewer.address)) fail(400, '이미 크리에이터입니다 (티어 존재)')
+
+  const periodMs = periodDays * 24 * 60 * 60 * 1000
+  const name = viewer.handle.split('.')[0]
+  const digest = await serialized(async () => {
+    await exec(CLI, ['client', 'switch', '--address', viewer.address])
+    const args = [
+      'client', 'ptb',
+      '--move-call', `${PKG}::subscriptions::create<${HANEUL_TYPE}>`,
+      `${price}`, `${periodMs}`, `"ipfs://humming-tier-${name}"`,
+      '--assign', 'tier_cap',
+      '--transfer-objects', '[tier_cap]', `@${viewer.address}`,
+    ]
+    // 잠금 모드는 티어와 같은 PTB로 원자 확정 (tease=티저 노출, lock=전면 잠금)
+    if (lockMode !== 'open') {
+      args.push(
+        '--move-call', `${PKG}::creator_prefs::set_prefs`,
+        `@${PREFS_REGISTRY}`, 'true', `${lockMode === 'tease'}`,
+      )
+    }
+    args.push('--gas-budget', '50000000')
+    const { stdout } = await exec(CLI, args, { maxBuffer: 16 * 1024 * 1024 })
+    const d = /Transaction Digest: (\S+)/.exec(stdout)?.[1]
+    if (!d || !/TierCreated/.test(stdout)) throw new Error(`티어 생성 tx 실패 (digest: ${d ?? '없음'})`)
+    return d
+  })
+  // KYC 스텁 통과 → 인증 크리에이터 배지
+  viewer.verified = true
+  persistAccounts()
+  console.log(`🎨 크리에이터 전환: ${viewer.handle} (${price / 1e9} HANEUL/${periodDays}일, ${lockMode}) tx=${digest}`)
+  return { digest, tier: { priceGeunhwa: price, periodMs }, lockMode, verified: true }
+})
+
+// 내 수익: 온체인 이벤트 3종(Subscribed/TipSent/PostPurchased)을 크리에이터 기준으로 집계.
+// 구독은 tier→creator, PPV·글 귀속 팁은 post→작성자로 귀속. net = amount − fee(5%).
+xrpc('get', 'app.humming.creator.getEarnings', async req => {
+  const viewer = requireAuthAcct(req)
+  const q = type => rpc('haneulx_queryEvents', [{ MoveEventType: `${PKG}::${type}` }, null, 50, true])
+  const [subs, tips, buys, posts, gate] = await Promise.all([
+    q('subscriptions::Subscribed'),
+    q('tips::TipSent'),
+    q('paid_posts::PostPurchased'),
+    loadPosts(),
+    loadGateState(),
+  ])
+  const authorOf = postId => posts.find(p => p.postId === String(postId))?.author.address
+  const nameOf = addr => byAddress(addr)?.handle ?? `${addr.slice(0, 8)}…`
+  const items = []
+  for (const e of subs.data) {
+    const p = e.parsedJson
+    const creator = gate.tierInfo.get(p.tier)?.creator
+    if (creator !== viewer.address) continue
+    items.push({
+      kind: 'subscription',
+      from: nameOf(p.subscriber),
+      grossGeunhwa: Number(p.amount),
+      netGeunhwa: Number(p.amount) - Number(p.fee),
+      atMs: Number(e.timestampMs),
+      tx: e.id.txDigest,
+    })
+  }
+  for (const e of tips.data) {
+    const p = e.parsedJson
+    if (p.to !== viewer.address) continue
+    items.push({
+      kind: 'tip',
+      from: nameOf(p.from),
+      postId: p.post_id ?? null,
+      grossGeunhwa: Number(p.amount),
+      netGeunhwa: Number(p.amount) - Number(p.fee),
+      atMs: Number(e.timestampMs),
+      tx: e.id.txDigest,
+    })
+  }
+  for (const e of buys.data) {
+    const p = e.parsedJson
+    if (authorOf(p.post_id) !== viewer.address) continue
+    items.push({
+      kind: 'purchase',
+      from: nameOf(p.buyer),
+      postId: p.post_id,
+      grossGeunhwa: Number(p.amount),
+      netGeunhwa: Number(p.amount) - Number(p.fee),
+      atMs: Number(e.timestampMs),
+      tx: e.id.txDigest,
+    })
+  }
+  items.sort((a, b) => b.atMs - a.atMs)
+  const sum = kind =>
+    items.filter(i => i.kind === kind).reduce((a, i) => a + i.netGeunhwa, 0)
+  const totals = {
+    subscriptionGeunhwa: sum('subscription'),
+    tipGeunhwa: sum('tip'),
+    purchaseGeunhwa: sum('purchase'),
+  }
+  totals.totalGeunhwa = totals.subscriptionGeunhwa + totals.tipGeunhwa + totals.purchaseGeunhwa
+  const tier = gate.tierByCreator.get(viewer.address) || null
+  return { totals, items: items.slice(0, 30), tier, isCreator: !!tier }
 })
 
 // --- catch-all: log what the app asks for, fail soft ---
