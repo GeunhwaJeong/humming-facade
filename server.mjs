@@ -9,12 +9,15 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { RPC_URL, PKG, NS_PKG, APP_WALLET } from './lib/config.mjs'
-import { loadKeys, importFromCliKeystore, createWallet } from './lib/keys.mjs'
+import { loadKeys, importFromCliKeystore, createWallet, removeWallet } from './lib/keys.mjs'
+import { client } from './lib/client.mjs'
 import {
-  client, execTx, faucet,
+  execTx, faucet,
   buildNewLeaf, buildCreatePost, buildSubscribe, buildPurchase, buildTip, buildBecomeCreator,
 } from './lib/chain.mjs'
-import { state as chainState, gateView, backfill, startPolling, stats } from './lib/indexer.mjs'
+import {
+  state as chainState, stateVersion, gateView, backfill, startPolling, stats,
+} from './lib/indexer.mjs'
 
 const PORT = 3025
 
@@ -233,8 +236,14 @@ function profileBasic(acct) {
 }
 
 let postCache = []
-// 인덱서의 PostCreated 전량(오름차순)을 최신순 게시물 뷰로 변환 — RPC 0회
+let postCacheVersion = -1
+// 인덱서의 PostCreated 전량(오름차순)을 최신순 게시물 뷰로 변환 — RPC 0회.
+// 인덱스 버전이 같으면 캐시 재사용 (fakeCid sha256 재계산 방지). 미디어 embed는
+// 만료형 서명 URL이라 캐시에 넣지 않고 응답 시점(gatePosts)에 자격자에게만 생성.
+// 캐시 항목은 요청 간 공유되므로 소비자는 불변으로 다뤄야 한다.
 async function loadPosts() {
+  if (postCacheVersion === stateVersion()) return postCache
+  const version = stateVersion() // 빌드 중 새 이벤트가 오면 다음 요청이 다시 빌드
   const mapped = await Promise.all(
     chainState.posts.toReversed().map(async ev => {
       const p = ev.parsedJson
@@ -257,8 +266,6 @@ async function loadPosts() {
             createdAt,
             langs: ['ko'],
           },
-          // 서명 URL은 게이팅 통과 응답에만 남음 — gatePosts가 비자격자에게서 제거
-          ...(media.length ? { embed: imagesEmbedView(media) } : {}),
           replyCount: 0,
           repostCount: 0,
           likeCount: 0,
@@ -271,14 +278,16 @@ async function loadPosts() {
       }
     }),
   )
-  postCache = mapped.filter(Boolean)
+  const cache = mapped.filter(Boolean)
   // reply counts
-  for (const item of postCache) {
+  for (const item of cache) {
     if (item.repliedTo != null) {
-      const parent = postCache.find(x => x.postId === String(item.repliedTo))
+      const parent = cache.find(x => x.postId === String(item.repliedTo))
       if (parent) parent.post.replyCount++
     }
   }
+  postCache = cache
+  postCacheVersion = version
   return postCache
 }
 
@@ -298,16 +307,19 @@ function gatePosts(posts, viewerAcct, gate) {
       pw && !isAuthor && !subscribed && !(viewer && gate.purchased.has(`${item.postId}:${viewer}`))
     const prefs = gate.prefsOf(item.author.address)
     const profileLocked = prefs.locked && !isAuthor && !subscribed
-    if (!paywallLocked && !profileLocked) return item
+    if (!paywallLocked && !profileLocked) {
+      // 자격자에게만 이 시점에 미디어 서명 URL 발급 (캐시엔 embed가 아예 없음 —
+      // 잠금의 실체는 "서버가 안 주는 것", 만료형 URL이 캐시에서 썩지도 않음)
+      if (!item.media.length) return item
+      return { ...item, post: { ...item.post, embed: imagesEmbedView(item.media) } }
+    }
     const tier = gate.tierByCreator.get(item.author.address) || null
     const priceH = pw ? Number(pw.price) / 1e9 : null
-    // 미디어 서명 URL(embed)은 응답에서 통째로 제거 — 잠금의 실체는 "서버가 안 주는 것".
-    // 개수/종류만 티저로 남긴다 (전환 유도, OnlyFans와 동일한 메커니즘)
-    const { embed: _stripped, ...gatedPost } = item.post
+    // 비자격자에겐 개수/종류만 티저로 남긴다 (전환 유도, OnlyFans와 동일한 메커니즘)
     return {
       ...item,
       post: {
-        ...gatedPost,
+        ...item.post,
         humming: {
           locked: true,
           reason: paywallLocked ? 'paywall' : 'profile',
@@ -383,11 +395,17 @@ xrpc('post', 'com.atproto.server.createAccount', async req => {
 
   // ① 새 지갑 — 인프로세스 키 생성, 파사드 키 저장소에 등록 (비수탁 전환 전까지의 수탁 데모)
   const { address } = createWallet()
-  // ② 가스 지급 (로컬넷 faucet; 메인넷에선 스폰서드 tx로 대체)
-  await faucet(address)
-  // ③ 닉네임 발급 — hum.haneul 부모 NFT 소유자(앱 지갑)가 서명·가스 부담.
-  //    APP_WALLET 서명 tx끼리만 직렬화되고 다른 지갑의 결제와는 병렬
-  await execTx(APP_WALLET, buildNewLeaf(h, address))
+  try {
+    // ② 가스 지급 (로컬넷 faucet; 메인넷에선 스폰서드 tx로 대체)
+    await faucet(address)
+    // ③ 닉네임 발급 — hum.haneul 부모 NFT 소유자(앱 지갑)가 서명·가스 부담.
+    //    APP_WALLET 서명 tx끼리만 직렬화되고 다른 지갑의 결제와는 병렬
+    await execTx(APP_WALLET, buildNewLeaf(h, address))
+  } catch (e) {
+    // 온체인 등록 실패(동시 가입으로 leaf 선점 등) → 방금 만든 키 롤백, 고아 키 방지
+    removeWallet(address)
+    throw e
+  }
   const acct = {
     handle: h,
     did: `did:web:${h}`,
