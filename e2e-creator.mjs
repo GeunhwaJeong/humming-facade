@@ -6,7 +6,7 @@ import { chromium } from 'playwright'
 
 const APP = process.env.APP_URL || 'http://localhost:19006'
 const RPC = 'http://127.0.0.1:9000'
-const PKG = '0x9bca9d7cfcdf10341f808448a6d74b38415fe33c846b64e37e4aa3908a048298'
+const PKG = '0xb95712343fe388084e0586512b539d0d69fef908f07a0e0ab453a666407c8c0d'
 const HANDLE = 'wasabi.hum.haneul'
 const SHOT = n => `/Users/jeong-gh/humming-facade/e2e-creator-${n}.png`
 const tid = id => `[data-testid="${id}"]`
