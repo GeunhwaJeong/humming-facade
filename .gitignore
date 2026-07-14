@@ -4,6 +4,8 @@ node_modules/
 # 런타임 데이터 — 커밋 금지
 accounts.json
 media/
+# 지갑 비밀키 (수탁 데모) — 절대 커밋 금지
+wallet-keys.json
 
 # 세션 임시 파일
 *.log

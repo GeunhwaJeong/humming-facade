@@ -1,35 +1,22 @@
 // Humming XRPC Facade — serves the Bluesky app from the Haneul chain.
 // The app speaks ATProto XRPC; we answer from humming contract events on localnet.
+// 쓰기 = SDK 인프로세스 서명(lib/chain), 읽기 = 커서 전량 인덱스(lib/indexer).
 import express from 'express'
 import cors from 'cors'
 import { CID } from 'multiformats/cid'
 import { sha256 } from 'multiformats/hashes/sha2'
-import { execFile } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { promisify } from 'node:util'
-
-const exec = promisify(execFile)
+import { RPC_URL, PKG, NS_PKG, APP_WALLET } from './lib/config.mjs'
+import { loadKeys, importFromCliKeystore, createWallet } from './lib/keys.mjs'
+import {
+  client, execTx, faucet,
+  buildNewLeaf, buildCreatePost, buildSubscribe, buildPurchase, buildTip, buildBecomeCreator,
+} from './lib/chain.mjs'
+import { state as chainState, gateView, backfill, startPolling, stats } from './lib/indexer.mjs'
 
 const PORT = 3025
-const RPC = 'http://127.0.0.1:9000'
-const PKG = '0x49082d2bdac8d4a0bb16ef0abdee252b926a56b2e4f8aa87000900d74d8ed5cc'
-const FEED = '0x139a5d29d3fde7b6c975ad6ccc29e0c16c59d75f8f39dfb6c4fb98cbc68feaad'
-const RULES = '0xf2fc4735918ba0bf9944585af2223a47ba93c3727bc50b7df3d7b07f3a44d9cb'
-const FEE_CONFIG = '0x3e2ad3ddeb71f3d9623a236892f71c6d4d9825c55611fa492eed879f44481e44'
-// creator_prefs 공유 레지스트리 — 설정 쓰기 PTB에만 필요 (읽기는 이벤트로)
-const PREFS_REGISTRY = '0x6779c778ddb6a1173569d23ddb1a8628e1ad02c8569869409c75e6990f7a94df'
-const HANEUL_TYPE = '0x2::haneul::HANEUL'
-const CLI = '/Users/jeong-gh/haneul/target/release/haneul'
-
-// ---- haneulns (온체인 네임서비스) — 가입 = 닉네임 = 지갑 ----
-// 가입 시 hum.haneul 부모 NFT로 leaf 서브네임을 발급 (수수료·NFT 없음, 앱이 가스 대납)
-const NS_PKG = '0xb4d93ff579dfaab8a07d959a687711cbd09fae06ac44f6e34521d45727a36a11'
-const NS_SUB_PKG = '0x02a625583d4c7c246a1561408824c881ffca8604681f7d4c3a86425e5cb039ef'
-const NS_OBJ = '0x594a4dbedce19110d77403646f17760eac203ba3594f78cca910faf020323338'
-const HUM_PARENT_NFT = '0xd2b869e28713b6e1370466b42f0aaa547d6eab66e19bacaed1af1132f5c7210c'
-const APP_WALLET = '0x7e6dc9a774eb022d809e3ab7e5d578126e98e5e351f07aee820951dd2b80c3de'
 
 // ---- 미디어 저장소: 콘텐츠는 오프체인, 체인에는 CID 포인터만 ----
 // 파일 삭제 = 콘텐츠 삭제 가능(법적 요건), 체인의 CID는 존재 증명만 남음
@@ -46,11 +33,10 @@ function mediaUrl(cid) {
   return `http://localhost:${PORT}/media/${cid}?exp=${exp}&sig=${signMedia(cid, exp)}`
 }
 
-// content_uri 인코딩: 본문 뒤에 따옴표 없는 미디어 포인터를 덧붙임
-// (PTB 문자열이 큰따옴표를 못 품는 제약과 호환되는 포맷)
+// content_uri 인코딩: 본문 뒤에 미디어 포인터를 덧붙임 (CID 전달 규약)
 const MEDIA_MARK = ' §media:'
 function encodeContent(text, media) {
-  const t = sanitizeText(text)
+  const t = text || ''
   if (!media?.length) return t
   return (
     t +
@@ -169,9 +155,9 @@ function deepFind(obj, key) {
 }
 async function getNsRegistryTable() {
   if (nsRegistryTable) return nsRegistryTable
-  const dfs = await rpc('haneulx_getDynamicFields', [NS_OBJ, null, 20])
+  const dfs = await client.getDynamicFields({ parentId: NS_OBJ, limit: 20 })
   const reg = dfs.data.find(d => (d.name?.type || '').includes('::haneulns::RegistryKey<'))
-  const obj = await rpc('haneul_getObject', [reg.objectId, { showContent: true }])
+  const obj = await client.getObject({ id: reg.objectId, options: { showContent: true } })
   nsRegistryTable = deepFind(obj.data.content.fields, 'registry').fields.id.id
   return nsRegistryTable
 }
@@ -181,10 +167,10 @@ async function chainNameRecord(handle) {
   if (labels.length < 2 || labels[0] !== 'haneul') return null
   try {
     const table = await getNsRegistryTable()
-    const res = await rpc('haneulx_getDynamicFieldObject', [
-      table,
-      { type: `${NS_PKG}::domain::Domain`, value: { labels } },
-    ])
+    const res = await client.getDynamicFieldObject({
+      parentId: table,
+      name: { type: `${NS_PKG}::domain::Domain`, value: { labels } },
+    })
     const fields = deepFind(res, 'target_address') !== undefined ? res : null
     if (!fields) return null
     return { target: deepFind(res, 'target_address') }
@@ -210,18 +196,6 @@ function didFromAuth(req) {
   } catch {
     return null
   }
-}
-
-// ---- Haneul JSON-RPC ----
-async function rpc(method, params) {
-  const res = await fetch(RPC, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-  })
-  const json = await res.json()
-  if (json.error) throw new Error(`${method}: ${JSON.stringify(json.error)}`)
-  return json.result
 }
 
 // ---- chain → lexicon mapping ----
@@ -259,28 +233,23 @@ function profileBasic(acct) {
 }
 
 let postCache = []
+// 인덱서의 PostCreated 전량(오름차순)을 최신순 게시물 뷰로 변환 — RPC 0회
 async function loadPosts() {
-  const result = await rpc('haneulx_queryEvents', [
-    { MoveEventType: `${PKG}::feed::PostCreated` },
-    null,
-    50,
-    true, // newest first
-  ])
   const mapped = await Promise.all(
-    result.data.map(async ev => {
+    chainState.posts.toReversed().map(async ev => {
       const p = ev.parsedJson
       const acct = byAddress(p.author)
       if (!acct) return null
-      const createdAt = new Date(Number(ev.timestampMs)).toISOString()
+      const createdAt = new Date(ev.timestampMs).toISOString()
       const { text, media } = decodeContent(p.content_uri)
       return {
-        postId: p.post_id,
+        postId: String(p.post_id),
         repliedTo: p.replied_to,
         author: acct,
         media,
         post: {
           uri: `at://${acct.did}/app.bsky.feed.post/${p.post_id}`,
-          cid: await fakeCid(ev.id.txDigest),
+          cid: await fakeCid(ev.txDigest),
           author: profileBasic(acct),
           record: {
             $type: 'app.bsky.feed.post',
@@ -313,57 +282,8 @@ async function loadPosts() {
   return postCache
 }
 
-// ---- paywall & subscription state — 매 요청 체인 이벤트에서 재구성 ----
-async function loadGateState() {
-  const q = type => rpc('haneulx_queryEvents', [{ MoveEventType: `${PKG}::${type}` }, null, 50, true])
-  const [pay, tiers, subs, buys, prefsEvents] = await Promise.all([
-    q('paid_posts::PaywallCreated'),
-    q('subscriptions::TierCreated'),
-    q('subscriptions::Subscribed'),
-    q('paid_posts::PostPurchased'),
-    q('creator_prefs::PrefsChanged'),
-  ])
-  // 프로필 잠금 설정의 진실의 원본 = 체인 (크리에이터 서명 이벤트, 최신이 승리)
-  const prefsByCreator = new Map()
-  for (const e of prefsEvents.data) {
-    const p = e.parsedJson
-    if (!prefsByCreator.has(p.creator)) {
-      prefsByCreator.set(p.creator, {
-        locked: !!p.profile_locked,
-        previews: !!p.show_locked_previews,
-      })
-    }
-  }
-  const prefsOf = addr => prefsByCreator.get(addr) || { locked: false, previews: true }
-  const paywallByPost = new Map(pay.data.map(e => [e.parsedJson.post_id, e.parsedJson]))
-  const tierInfo = new Map(tiers.data.map(e => [e.parsedJson.tier, e.parsedJson]))
-  // (tier, subscriber) → 최신 만료시각 (연장 구독은 이벤트가 여러 번 — 최댓값이 진실)
-  const subExpiry = new Map()
-  for (const e of subs.data) {
-    const p = e.parsedJson
-    const k = `${p.tier}:${p.subscriber}`
-    if (Number(p.expires_ms) > (subExpiry.get(k) || 0)) subExpiry.set(k, Number(p.expires_ms))
-  }
-  const purchased = new Set(buys.data.map(e => `${e.parsedJson.post_id}:${e.parsedJson.buyer}`))
-  const isSubscribedTo = (viewerAddr, creatorAddr) => {
-    const now = Date.now()
-    for (const [tier, t] of tierInfo) {
-      if (t.creator === creatorAddr && (subExpiry.get(`${tier}:${viewerAddr}`) || 0) > now) return true
-    }
-    return false
-  }
-  const tierByCreator = new Map()
-  for (const [id, t] of tierInfo) {
-    if (!tierByCreator.has(t.creator)) {
-      tierByCreator.set(t.creator, {
-        id,
-        priceGeunhwa: Number(t.price),
-        periodMs: Number(t.period_ms),
-      })
-    }
-  }
-  return { paywallByPost, isSubscribedTo, purchased, tierInfo, subExpiry, tierByCreator, prefsOf }
-}
+// ---- paywall & subscription state — 인덱서의 전량 인메모리 상태에서 파생 ----
+const loadGateState = () => gateView()
 
 // 비열람 자격 뷰어에게는 본문 대신 잠금 정보를 내려줌.
 // post.humming 마커(구조화)로 humming-app이 네이티브 잠금 카드를 그리고,
@@ -461,39 +381,22 @@ xrpc('post', 'com.atproto.server.createAccount', async req => {
   if (byHandle(h)) fail(400, 'HandleNotAvailable', '이미 사용 중인 닉네임입니다')
   if (await chainNameRecord(h)) fail(400, 'HandleNotAvailable', '이미 온체인에 등록된 닉네임입니다')
 
-  const acct = await serialized(async () => {
-    // ① 새 지갑 — 파사드 키스토어에 등록 (비수탁 전환 전까지의 수탁 데모)
-    let address
-    try {
-      const { stdout } = await exec(CLI, ['client', 'new-address', 'ed25519', `hum-${name}`])
-      address = (stdout.match(/0x[0-9a-f]{64}/) || [])[0]
-    } catch {
-      // 키스토어는 로컬넷 regenesis와 무관하게 영속 — 이전 세션의 alias가 남아 있으면
-      // 그 키를 재사용 (온체인 이름 중복검사는 위에서 이미 통과)
-      const { stdout } = await exec(CLI, ['keytool', 'list', '--json'])
-      address = JSON.parse(stdout).find(k => k.alias === `hum-${name}`)?.haneulAddress
-    }
-    if (!address) throw new Error('wallet creation failed')
-    // ② 가스 지급 (로컬넷 faucet; 메인넷에선 스폰서드 tx로 대체)
-    await exec(CLI, ['client', 'faucet', '--address', address])
-    // ③ 닉네임 발급 — hum.haneul 부모 NFT 소유자(앱 지갑)가 서명·가스 부담
-    await exec(CLI, ['client', 'switch', '--address', APP_WALLET])
-    await exec(CLI, [
-      'client', 'ptb',
-      '--move-call', `${NS_SUB_PKG}::subdomains::new_leaf`,
-      `@${NS_OBJ}`, `@${HUM_PARENT_NFT}`, '@0x6', `"${h}"`, `@${address}`,
-      '--gas-budget', '50000000',
-    ])
-    return {
-      handle: h,
-      did: `did:web:${h}`,
-      address,
-      displayName: name,
-      description: 'Humming 신규 유저',
-      password,
-      signup: true,
-    }
-  })
+  // ① 새 지갑 — 인프로세스 키 생성, 파사드 키 저장소에 등록 (비수탁 전환 전까지의 수탁 데모)
+  const { address } = createWallet()
+  // ② 가스 지급 (로컬넷 faucet; 메인넷에선 스폰서드 tx로 대체)
+  await faucet(address)
+  // ③ 닉네임 발급 — hum.haneul 부모 NFT 소유자(앱 지갑)가 서명·가스 부담.
+  //    APP_WALLET 서명 tx끼리만 직렬화되고 다른 지갑의 결제와는 병렬
+  await execTx(APP_WALLET, buildNewLeaf(h, address))
+  const acct = {
+    handle: h,
+    did: `did:web:${h}`,
+    address,
+    displayName: name,
+    description: 'Humming 신규 유저',
+    password,
+    signup: true,
+  }
   ACCOUNTS.push(acct)
   persistAccounts()
   console.log(`🐣 가입: ${acct.handle} → 지갑 ${acct.address.slice(0, 10)}… (온체인 leaf 등록)`)
@@ -766,17 +669,8 @@ xrpc('get', 'app.bsky.feed.getFeed', async req => {
   return { feed: posts.map(p => ({ post: p.post })) }
 })
 
-// --- writes: app → facade → PTB → chain ---
-// CLI의 active address가 전역 상태라 쓰기는 큐로 직렬화
-let writeQueue = Promise.resolve()
-function serialized(fn) {
-  const run = writeQueue.then(fn, fn)
-  writeQueue = run.catch(() => {})
-  return run
-}
-
-// PTB 문자열 리터럴은 큰따옴표/역슬래시를 못 품음 — 데모 편법으로 유사 문자 치환
-const sanitizeText = t => (t || '').replace(/"/g, '”').replace(/\\/g, '＼')
+// --- writes: app → facade → SDK Transaction → chain ---
+// 직렬화는 lib/chain의 per-address 큐가 담당 — 지갑이 다르면 완전 병렬
 
 // ATProto TID(13자 base32-sortable) — commit.rev가 이 형식이 아니면 앱이 응답을 거부함
 const TID_CHARS = '234567abcdefghijklmnopqrstuvwxyz'
@@ -798,37 +692,21 @@ async function submitPostOnChain(acct, text, parentId, media, paywallGeunhwa) {
     Number(paywallGeunhwa) <= 100_000_000_000
       ? Math.floor(Number(paywallGeunhwa))
       : null
-  return serialized(async () => {
-    await exec(CLI, ['client', 'switch', '--address', acct.address])
-    const args = [
-      'client', 'ptb',
-      '--move-call', `${PKG}::feed::request_create_post`,
-      `@${FEED}`, `"${encodeContent(text, media)}"`,
-      parentId != null ? `some(${parentId})` : 'none', 'none', 'none',
-      '--assign', 'r',
-      '--move-call', `${PKG}::feed::execute_create_post`,
-      `@${FEED}`, `@${RULES}`, 'r.0', 'r.1', '@0x6',
-    ]
-    // 글 작성과 페이월 생성을 한 tx로 원자 확정 — 가격 없는 유료 글이 생길 틈이 없음
-    if (paywall) {
-      args.push(
-        '--assign', 'pid',
-        '--move-call', `${PKG}::paid_posts::create<${HANEUL_TYPE}>`,
-        `@${FEED}`, 'pid', `${paywall}`,
-      )
-    }
-    args.push('--gas-budget', '50000000')
-    const { stdout } = await exec(CLI, args, { maxBuffer: 16 * 1024 * 1024 })
-    const digest = /Transaction Digest: (\S+)/.exec(stdout)?.[1]
-    const postId = /post_id\s*│\s*(\d+)/.exec(stdout)?.[1]
-    if (!postId) throw new Error(`PostCreated 이벤트 미발견 (tx: ${digest ?? '없음'})`)
-    if (paywall && !/PaywallCreated/.test(stdout))
-      throw new Error(`페이월 생성 실패 (tx: ${digest})`)
-    console.log(
-      `⛓️  쓰기: post_id=${postId} by ${acct.handle}${paywall ? ` [유료 ${paywall / 1e9} HANEUL]` : ''} tx=${digest}`,
-    )
-    return { postId, digest }
-  })
+  // 글 작성과 페이월 생성을 한 tx로 원자 확정 — 가격 없는 유료 글이 생길 틈이 없음
+  const { digest, events } = await execTx(
+    acct.address,
+    buildCreatePost(encodeContent(text, media), parentId, paywall),
+    'PostCreated',
+  )
+  const postId = String(
+    events.find(e => e.type === `${PKG}::feed::PostCreated`).parsedJson.post_id,
+  )
+  if (paywall && !events.some(e => e.type.endsWith('::PaywallCreated')))
+    throw new Error(`페이월 생성 실패 (tx: ${digest})`)
+  console.log(
+    `⛓️  쓰기: post_id=${postId} by ${acct.handle}${paywall ? ` [유료 ${paywall / 1e9} HANEUL]` : ''} tx=${digest}`,
+  )
+  return { postId, digest }
 }
 
 const parentIdFromUri = uri => /\/app\.bsky\.feed\.post\/(\d+)$/.exec(uri || '')?.[1] ?? null
@@ -1024,25 +902,11 @@ xrpc('post', 'app.humming.monetization.subscribe', async req => {
     e.status = 400
     throw e
   }
-  const digest = await serialized(async () => {
-    await exec(CLI, ['client', 'switch', '--address', viewer.address])
-    const { stdout } = await exec(
-      CLI,
-      [
-        'client', 'ptb',
-        '--split-coins', 'gas', `[${price}]`,
-        '--assign', 'pay',
-        '--move-call', `${PKG}::subscriptions::subscribe<${HANEUL_TYPE}>`,
-        `@${tierId}`, `@${FEE_CONFIG}`, `@${viewer.address}`, `${price}`, 'pay.0', '@0x6',
-        '--transfer-objects', '[pay.0]', `@${viewer.address}`,
-        '--gas-budget', '50000000',
-      ],
-      { maxBuffer: 16 * 1024 * 1024 },
-    )
-    const d = /Transaction Digest: (\S+)/.exec(stdout)?.[1]
-    if (!d || !/Subscribed/.test(stdout)) throw new Error(`구독 tx 실패 (digest: ${d ?? '없음'})`)
-    return d
-  })
+  const { digest } = await execTx(
+    viewer.address,
+    buildSubscribe(tierId, price, viewer.address),
+    'Subscribed',
+  )
   console.log(`💳 구독: ${viewer.handle} → ${creator.handle} (${price / 1e9} HANEUL) tx=${digest}`)
   return { digest, priceGeunhwa: price }
 })
@@ -1064,25 +928,11 @@ xrpc('post', 'app.humming.monetization.purchasePost', async req => {
     throw e
   }
   const price = Number(pw.price)
-  const digest = await serialized(async () => {
-    await exec(CLI, ['client', 'switch', '--address', viewer.address])
-    const { stdout } = await exec(
-      CLI,
-      [
-        'client', 'ptb',
-        '--split-coins', 'gas', `[${price}]`,
-        '--assign', 'pay',
-        '--move-call', `${PKG}::paid_posts::purchase<${HANEUL_TYPE}>`,
-        `@${pw.paywall}`, `@${FEE_CONFIG}`, `@${FEED}`, `${price}`, 'pay.0',
-        '--transfer-objects', '[pay.0]', `@${viewer.address}`,
-        '--gas-budget', '50000000',
-      ],
-      { maxBuffer: 16 * 1024 * 1024 },
-    )
-    const d = /Transaction Digest: (\S+)/.exec(stdout)?.[1]
-    if (!d || !/PostPurchased/.test(stdout)) throw new Error(`단건 구매 tx 실패 (digest: ${d ?? '없음'})`)
-    return d
-  })
+  const { digest } = await execTx(
+    viewer.address,
+    buildPurchase(pw.paywall, price, viewer.address),
+    'PostPurchased',
+  )
   console.log(`🎟️ 단건 구매: ${viewer.handle} → post ${postId} (${price / 1e9} HANEUL) tx=${digest}`)
   return { digest, priceGeunhwa: price, postId }
 })
@@ -1105,27 +955,11 @@ xrpc('post', 'app.humming.monetization.tip', async req => {
     e.status = 400
     throw e
   }
-  const call = postId
-    ? [`${PKG}::tips::tip_post<${HANEUL_TYPE}>`, `@${FEE_CONFIG}`, `@${FEED}`, `${postId}`, `${amount}`, 'pay.0']
-    : [`${PKG}::tips::tip<${HANEUL_TYPE}>`, `@${FEE_CONFIG}`, `@${creator.address}`, `${amount}`, 'pay.0']
-  const digest = await serialized(async () => {
-    await exec(CLI, ['client', 'switch', '--address', viewer.address])
-    const { stdout } = await exec(
-      CLI,
-      [
-        'client', 'ptb',
-        '--split-coins', 'gas', `[${amount}]`,
-        '--assign', 'pay',
-        '--move-call', ...call,
-        '--transfer-objects', '[pay.0]', `@${viewer.address}`,
-        '--gas-budget', '50000000',
-      ],
-      { maxBuffer: 16 * 1024 * 1024 },
-    )
-    const d = /Transaction Digest: (\S+)/.exec(stdout)?.[1]
-    if (!d || !/TipSent/.test(stdout)) throw new Error(`팁 tx 실패 (digest: ${d ?? '없음'})`)
-    return d
-  })
+  const { digest } = await execTx(
+    viewer.address,
+    buildTip(creator.address, postId, amount, viewer.address),
+    'TipSent',
+  )
   console.log(`💰 팁: ${viewer.handle} → ${creator.handle}${postId ? ` (post ${postId})` : ''} (${amount / 1e9} HANEUL) tx=${digest}`)
   return { digest, amountGeunhwa: amount }
 })
@@ -1152,28 +986,12 @@ xrpc('post', 'app.humming.creator.becomeCreator', async req => {
 
   const periodMs = periodDays * 24 * 60 * 60 * 1000
   const name = viewer.handle.split('.')[0]
-  const digest = await serialized(async () => {
-    await exec(CLI, ['client', 'switch', '--address', viewer.address])
-    const args = [
-      'client', 'ptb',
-      '--move-call', `${PKG}::subscriptions::create<${HANEUL_TYPE}>`,
-      `${price}`, `${periodMs}`, `"ipfs://humming-tier-${name}"`,
-      '--assign', 'tier_cap',
-      '--transfer-objects', '[tier_cap]', `@${viewer.address}`,
-    ]
-    // 잠금 모드는 티어와 같은 PTB로 원자 확정 (tease=티저 노출, lock=전면 잠금)
-    if (lockMode !== 'open') {
-      args.push(
-        '--move-call', `${PKG}::creator_prefs::set_prefs`,
-        `@${PREFS_REGISTRY}`, 'true', `${lockMode === 'tease'}`,
-      )
-    }
-    args.push('--gas-budget', '50000000')
-    const { stdout } = await exec(CLI, args, { maxBuffer: 16 * 1024 * 1024 })
-    const d = /Transaction Digest: (\S+)/.exec(stdout)?.[1]
-    if (!d || !/TierCreated/.test(stdout)) throw new Error(`티어 생성 tx 실패 (digest: ${d ?? '없음'})`)
-    return d
-  })
+  // 잠금 모드는 티어와 같은 tx로 원자 확정 (tease=티저 노출, lock=전면 잠금)
+  const { digest } = await execTx(
+    viewer.address,
+    buildBecomeCreator(price, periodMs, `ipfs://humming-tier-${name}`, lockMode, viewer.address),
+    'TierCreated',
+  )
   // KYC 스텁 통과 → 인증 크리에이터 배지
   viewer.verified = true
   persistAccounts()
@@ -1185,55 +1003,29 @@ xrpc('post', 'app.humming.creator.becomeCreator', async req => {
 // 구독은 tier→creator, PPV·글 귀속 팁은 post→작성자로 귀속. net = amount − fee(5%).
 xrpc('get', 'app.humming.creator.getEarnings', async req => {
   const viewer = requireAuthAcct(req)
-  const q = type => rpc('haneulx_queryEvents', [{ MoveEventType: `${PKG}::${type}` }, null, 50, true])
-  const [subs, tips, buys, posts, gate] = await Promise.all([
-    q('subscriptions::Subscribed'),
-    q('tips::TipSent'),
-    q('paid_posts::PostPurchased'),
-    loadPosts(),
-    loadGateState(),
-  ])
+  // 인덱서의 수익 원장(제네시스부터 전량) 기준 — 50건 초과분도 유실 없음
+  const [posts, gate] = [await loadPosts(), loadGateState()]
   const authorOf = postId => posts.find(p => p.postId === String(postId))?.author.address
   const nameOf = addr => byAddress(addr)?.handle ?? `${addr.slice(0, 8)}…`
   const items = []
-  for (const e of subs.data) {
+  for (const e of chainState.earnings) {
     const p = e.parsedJson
-    const creator = gate.tierInfo.get(p.tier)?.creator
-    if (creator !== viewer.address) continue
-    items.push({
-      kind: 'subscription',
-      from: nameOf(p.subscriber),
+    const base = {
       grossGeunhwa: Number(p.amount),
       netGeunhwa: Number(p.amount) - Number(p.fee),
-      atMs: Number(e.timestampMs),
-      tx: e.id.txDigest,
-    })
-  }
-  for (const e of tips.data) {
-    const p = e.parsedJson
-    if (p.to !== viewer.address) continue
-    items.push({
-      kind: 'tip',
-      from: nameOf(p.from),
-      postId: p.post_id ?? null,
-      grossGeunhwa: Number(p.amount),
-      netGeunhwa: Number(p.amount) - Number(p.fee),
-      atMs: Number(e.timestampMs),
-      tx: e.id.txDigest,
-    })
-  }
-  for (const e of buys.data) {
-    const p = e.parsedJson
-    if (authorOf(p.post_id) !== viewer.address) continue
-    items.push({
-      kind: 'purchase',
-      from: nameOf(p.buyer),
-      postId: p.post_id,
-      grossGeunhwa: Number(p.amount),
-      netGeunhwa: Number(p.amount) - Number(p.fee),
-      atMs: Number(e.timestampMs),
-      tx: e.id.txDigest,
-    })
+      atMs: e.timestampMs,
+      tx: e.txDigest,
+    }
+    if (e.shortType === 'subscriptions::Subscribed') {
+      if (gate.tierInfo.get(p.tier)?.creator !== viewer.address) continue
+      items.push({ kind: 'subscription', from: nameOf(p.subscriber), ...base })
+    } else if (e.shortType === 'tips::TipSent') {
+      if (p.to !== viewer.address) continue
+      items.push({ kind: 'tip', from: nameOf(p.from), postId: p.post_id ?? null, ...base })
+    } else {
+      if (authorOf(p.post_id) !== viewer.address) continue
+      items.push({ kind: 'purchase', from: nameOf(p.buyer), postId: p.post_id, ...base })
+    }
   }
   items.sort((a, b) => b.atMs - a.atMs)
   const sum = kind =>
@@ -1254,10 +1046,20 @@ app.all('/xrpc/:nsid', (req, res) => {
   res.status(501).json({ error: 'MethodNotImplemented', message: req.params.nsid })
 })
 
-app.listen(PORT, () => {
+// ---- 부팅: 키 로드 → 이벤트 전량 백필 → 서빙 시작 → 증분 폴링 ----
+loadKeys()
+const imported = importFromCliKeystore([...ACCOUNTS.map(a => a.address), APP_WALLET])
+if (imported) console.log(`🔑 CLI 키스토어에서 계정 키 ${imported}개 임포트`)
+
+app.listen(PORT, async () => {
   console.log(`🚀 Humming XRPC 파사드: http://localhost:${PORT}`)
-  console.log(`   체인: ${RPC} / 패키지: ${PKG.slice(0, 10)}…`)
-  loadPosts()
-    .then(p => console.log(`   온체인 게시물 ${p.length}개 로드 완료`))
-    .catch(e => console.error('   ⚠️ 체인 조회 실패:', e.message))
+  console.log(`   체인: ${RPC_URL} / 패키지: ${PKG.slice(0, 10)}…`)
+  try {
+    await backfill()
+    console.log(`   ⛓️  이벤트 백필 완료: ${stats()}`)
+  } catch (e) {
+    // 체인 미가동이면 폴링이 커서부터 이어서 따라잡음 — 서빙은 계속
+    console.error('   ⚠️ 이벤트 백필 실패 (폴링이 재시도):', e.message)
+  }
+  startPolling()
 })
