@@ -680,6 +680,18 @@ xrpc('get', 'app.bsky.feed.getActorFeeds', () => ({ feeds: [] }))
 xrpc('get', 'app.bsky.unspecced.getTrends', () => ({ trends: [] }))
 xrpc('get', 'app.bsky.unspecced.getSuggestedUsersForExplore', () => ({ actors: [] }))
 xrpc('get', 'app.bsky.unspecced.getSuggestedStarterPacks', () => ({ starterPacks: [] }))
+xrpc('get', 'app.bsky.unspecced.getOnboardingSuggestedStarterPacks', () => ({ starterPacks: [] }))
+// 온보딩 3단계 "나를 위한 추천" — 시드·가입 계정을 그대로 추천 (카테고리는 무시, 계정 풀이 작음)
+xrpc('get', 'app.bsky.unspecced.getSuggestedOnboardingUsers', req => {
+  const viewer = byDid(didFromAuth(req))
+  const limit = Number(req.query.limit) || 10
+  const actors = ACCOUNTS.filter(a => a.did !== viewer?.did)
+    .slice(0, limit)
+    .map(a => ({ ...profileBasic(a), description: a.description }))
+  return { actors, recIdStr: 'humming-seed' }
+})
+xrpc('get', 'app.bsky.draft.getDrafts', () => ({ drafts: [] }))
+xrpc('get', 'chat.bsky.convo.getConvoAvailability', () => ({ canChat: false }))
 xrpc('get', 'app.bsky.unspecced.getSuggestedFeeds', () => ({ feeds: [] }))
 // "내 피드"에서 following 외 피드 요청 시에도 온체인 타임라인 반환
 xrpc('get', 'app.bsky.feed.getFeed', async req => {
@@ -853,6 +865,23 @@ xrpc('post', 'com.atproto.repo.createRecord', async req => {
 
 // 미매핑 레코드 삭제(좋아요 취소 등)도 소프트 수용
 xrpc('post', 'com.atproto.repo.deleteRecord', () => ({}))
+
+// 프로필 저장(온보딩 마지막 단계·프로필 편집)은 계정 메타데이터에 반영, 그 외엔 수용만
+xrpc('post', 'com.atproto.repo.putRecord', async req => {
+  const acct = requireAuthAcct(req)
+  const { collection, rkey, record } = req.body
+  if (collection === 'app.bsky.actor.profile') {
+    if (record?.displayName) acct.displayName = record.displayName
+    if (record?.description !== undefined) acct.description = record.description || ''
+    if (acct.signup) persistAccounts()
+  } else {
+    console.log(`   (putRecord: ${collection} 미매핑 — 수용만)`)
+  }
+  return {
+    uri: `at://${acct.did}/${collection}/${rkey || 'self'}`,
+    cid: await fakeCid(acct.did + collection + JSON.stringify(record ?? {})),
+  }
+})
 
 // --- app.humming.monetization: 구독/팁 — humming-app 네이티브 버튼이 호출 ---
 // 크리에이터의 티어 + 뷰어의 구독 상태 (버튼 렌더링용)
