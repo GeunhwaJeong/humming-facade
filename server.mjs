@@ -36,21 +36,38 @@ function mediaUrl(cid) {
   return `http://localhost:${PORT}/media/${cid}?exp=${exp}&sig=${signMedia(cid, exp)}`
 }
 
-// content_uri 인코딩: 본문 뒤에 미디어 포인터를 덧붙임 (CID 전달 규약)
+// content_uri 인코딩: 본문 뒤에 미디어 포인터·언어 태그를 덧붙임 (CID 전달 규약)
+// 형식: <text>[ §media:...][ §langs:ko,en] — 마커는 항상 이 순서로 뒤에 온다
 const MEDIA_MARK = ' §media:'
-function encodeContent(text, media) {
-  const t = text || ''
-  if (!media?.length) return t
-  return (
-    t +
-    MEDIA_MARK +
-    media.map(m => `${m.cid}~${m.mime.replace('/', '_')}~${m.w}x${m.h}`).join(',')
-  )
+const LANGS_MARK = ' §langs:'
+// BCP-47 형태만 통과 (컴포저 언어 선택값), 최대 3개 — ATProto post.langs 상한과 동일
+function cleanLangs(langs) {
+  if (!Array.isArray(langs)) return []
+  return langs
+    .filter(l => typeof l === 'string' && /^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{2,8})*$/.test(l))
+    .slice(0, 3)
+}
+function encodeContent(text, media, langs) {
+  let t = text || ''
+  if (media?.length)
+    t +=
+      MEDIA_MARK +
+      media.map(m => `${m.cid}~${m.mime.replace('/', '_')}~${m.w}x${m.h}`).join(',')
+  const ls = cleanLangs(langs)
+  if (ls.length) t += LANGS_MARK + ls.join(',')
+  return t
 }
 function decodeContent(raw) {
-  const i = (raw || '').indexOf(MEDIA_MARK)
-  if (i < 0) return { text: raw || '', media: [] }
-  const media = raw
+  let rest = raw || ''
+  let langs = []
+  const li = rest.lastIndexOf(LANGS_MARK)
+  if (li >= 0) {
+    langs = cleanLangs(rest.slice(li + LANGS_MARK.length).split(','))
+    rest = rest.slice(0, li)
+  }
+  const i = rest.indexOf(MEDIA_MARK)
+  if (i < 0) return { text: rest, media: [], langs }
+  const media = rest
     .slice(i + MEDIA_MARK.length)
     .split(',')
     .map(s => {
@@ -59,7 +76,7 @@ function decodeContent(raw) {
       return { cid, mime: (mime || 'image_jpeg').replace('_', '/'), w: w || 0, h: h || 0 }
     })
     .filter(m => m.cid)
-  return { text: raw.slice(0, i), media }
+  return { text: rest.slice(0, i), media, langs }
 }
 
 function imagesEmbedView(media) {
@@ -87,7 +104,7 @@ const ACCOUNTS = [
     did: 'did:web:bob.hum.haneul',
     address: '0x8af0079f1c61849b3c5563ba123ed5413fcc05c8963fd0ecf81bd8220b067014',
     displayName: 'Bob 🐝',
-    description: 'Humming 크리에이터 — 이 프로필은 Haneul 온체인 데이터입니다',
+    description: 'Humming creator — this profile is Haneul on-chain data',
     password: 'humming',
     // 크리에이터 신원·연령 인증 완료 (실서비스에선 KYC 절차 통과가 조건)
     verified: true,
@@ -97,7 +114,7 @@ const ACCOUNTS = [
     did: 'did:web:alice.hum.haneul',
     address: '0xa5a8018f9eea5421ff6e9001bb0b8b502e5dd8d40265c38b728c3a1f5e5cf3f0',
     displayName: 'Alice ✨',
-    description: 'Humming 첫 구독자',
+    description: 'Humming early subscriber',
     password: 'humming',
   },
   {
@@ -106,7 +123,7 @@ const ACCOUNTS = [
     did: 'did:web:carol.hum.haneul',
     address: '0x721790f36e8ae1c71849c5b9897b2a9a150015da1ca37be20f74fbdea4580103',
     displayName: 'Carol 🌱',
-    description: '구독자 전용 프로필 — 모든 게시물이 구독으로 열립니다',
+    description: 'Subscribers-only profile — every post unlocks with a subscription',
     password: 'humming',
     verified: true,
     // 프로필 잠금 설정은 온체인(creator_prefs) — carol이 직접 서명해 설정함
@@ -117,7 +134,7 @@ const ACCOUNTS = [
     did: 'did:web:dave.hum.haneul',
     address: '0xff8a26d90d7061bc2ec49849e69caf04047944bc53b41abc6d3586eec90f9da9',
     displayName: 'Dave 🎧',
-    description: 'Humming 신규 유저',
+    description: 'New on Humming',
     password: 'humming',
   },
   {
@@ -126,7 +143,7 @@ const ACCOUNTS = [
     did: 'did:web:erin.hum.haneul',
     address: '0x454b30d5ca6c69048cf050368d3bf3c75fd7ed32427ac1c24b9d696dba9bd1a7',
     displayName: 'Erin 🌊',
-    description: 'Humming 신규 유저',
+    description: 'New on Humming',
     password: 'humming',
   },
 ]
@@ -250,7 +267,7 @@ async function loadPosts() {
       const acct = byAddress(p.author)
       if (!acct) return null
       const createdAt = new Date(ev.timestampMs).toISOString()
-      const { text, media } = decodeContent(p.content_uri)
+      const { text, media, langs } = decodeContent(p.content_uri)
       return {
         postId: String(p.post_id),
         repliedTo: p.replied_to,
@@ -264,7 +281,8 @@ async function loadPosts() {
             $type: 'app.bsky.feed.post',
             text,
             createdAt,
-            langs: ['ko'],
+            // 언어는 컴포저 선택값이 content_uri에 실려 온 것 — 없으면 필드 생략
+            ...(langs.length ? { langs } : {}),
           },
           replyCount: 0,
           repostCount: 0,
@@ -332,8 +350,8 @@ function gatePosts(posts, viewerAcct, gate) {
         record: {
           ...item.post.record,
           text: paywallLocked
-            ? `🔒 구독자 전용 게시물입니다\n\n@${item.author.handle} 구독 또는 단건 구매(${priceH} HANEUL)로 열람할 수 있어요. 열람 자격은 Haneul 온체인 구독 상태로 판정됩니다.`
-            : `🔒 @${item.author.handle}의 게시물은 구독자에게만 공개됩니다.`,
+            ? `🔒 Subscribers-only post\n\nSubscribe to @${item.author.handle} or buy this post (${priceH} HANEUL) to view it. Access is verified by the on-chain subscription state on Haneul.`
+            : `🔒 Posts from @${item.author.handle} are visible to subscribers only.`,
         },
       },
     }
@@ -389,9 +407,9 @@ xrpc('post', 'com.atproto.server.createAccount', async req => {
   const name = h.slice(0, -'.hum.haneul'.length)
   // 온체인 제약과 동일: SubDomainConfig min_label_size=3, 라벨 문자셋
   if (!/^[a-z0-9][a-z0-9-]{1,28}[a-z0-9]$/.test(name))
-    fail(400, 'InvalidHandle', '닉네임은 3~30자의 영소문자/숫자/하이픈이어야 합니다')
-  if (byHandle(h)) fail(400, 'HandleNotAvailable', '이미 사용 중인 닉네임입니다')
-  if (await chainNameRecord(h)) fail(400, 'HandleNotAvailable', '이미 온체인에 등록된 닉네임입니다')
+    fail(400, 'InvalidHandle', 'Nicknames must be 3-30 characters of lowercase letters, digits, or hyphens')
+  if (byHandle(h)) fail(400, 'HandleNotAvailable', 'This nickname is already taken')
+  if (await chainNameRecord(h)) fail(400, 'HandleNotAvailable', 'This nickname is already registered on-chain')
 
   // ① 새 지갑 — 인프로세스 키 생성, 파사드 키 저장소에 등록 (비수탁 전환 전까지의 수탁 데모)
   const { address } = createWallet()
@@ -411,7 +429,7 @@ xrpc('post', 'com.atproto.server.createAccount', async req => {
     did: `did:web:${h}`,
     address,
     displayName: name,
-    description: 'Humming 신규 유저',
+    description: 'New on Humming',
     password,
     signup: true,
   }
@@ -714,7 +732,7 @@ function tidNow() {
   return s
 }
 
-async function submitPostOnChain(acct, text, parentId, media, paywallGeunhwa) {
+async function submitPostOnChain(acct, text, parentId, media, paywallGeunhwa, langs) {
   // 페이월 가격은 서버가 재검증 (클라이언트 값 신뢰 금지): 0.01~100 HANEUL
   const paywall =
     Number.isFinite(Number(paywallGeunhwa)) &&
@@ -725,14 +743,14 @@ async function submitPostOnChain(acct, text, parentId, media, paywallGeunhwa) {
   // 글 작성과 페이월 생성을 한 tx로 원자 확정 — 가격 없는 유료 글이 생길 틈이 없음
   const { digest, events } = await execTx(
     acct.address,
-    buildCreatePost(encodeContent(text, media), parentId, paywall),
+    buildCreatePost(encodeContent(text, media, langs), parentId, paywall),
     'PostCreated',
   )
   const postId = String(
     events.find(e => e.type === `${PKG}::feed::PostCreated`).parsedJson.post_id,
   )
   if (paywall && !events.some(e => e.type.endsWith('::PaywallCreated')))
-    throw new Error(`페이월 생성 실패 (tx: ${digest})`)
+    throw new Error(`Paywall creation failed (tx: ${digest})`)
   console.log(
     `⛓️  쓰기: post_id=${postId} by ${acct.handle}${paywall ? ` [유료 ${paywall / 1e9} HANEUL]` : ''} tx=${digest}`,
   )
@@ -782,7 +800,7 @@ app.get('/media/:cid', (req, res) => {
   const { exp, sig } = req.query
   if (!/^[a-z2-7]+$/.test(cid)) return res.status(400).end()
   if (!exp || Number(exp) < Date.now() || sig !== signMedia(cid, exp)) {
-    return res.status(403).json({ error: 'Forbidden', message: '서명이 없거나 만료된 미디어 URL' })
+    return res.status(403).json({ error: 'Forbidden', message: 'Missing or expired media URL signature' })
   }
   const file = path.join(MEDIA_DIR, cid)
   if (!fs.existsSync(file)) return res.status(404).end()
@@ -815,7 +833,7 @@ xrpc('post', 'com.atproto.repo.applyWrites', async req => {
     if (isCreate && w.collection === 'app.bsky.feed.post') {
       const parentId = parentIdFromUri(w.value?.reply?.parent?.uri)
       const media = mediaFromEmbed(w.value?.embed)
-      const { postId, digest } = await submitPostOnChain(acct, w.value?.text, parentId, media, w.value?.humming?.paywallGeunhwa)
+      const { postId, digest } = await submitPostOnChain(acct, w.value?.text, parentId, media, w.value?.humming?.paywallGeunhwa, w.value?.langs)
       results.push({
         $type: 'com.atproto.repo.applyWrites#createResult',
         uri: `at://${acct.did}/app.bsky.feed.post/${postId}`,
@@ -845,7 +863,7 @@ xrpc('post', 'com.atproto.repo.createRecord', async req => {
   if (collection === 'app.bsky.feed.post') {
     const parentId = parentIdFromUri(record?.reply?.parent?.uri)
     const media = mediaFromEmbed(record?.embed)
-    const { postId, digest } = await submitPostOnChain(acct, record?.text, parentId, media, record?.humming?.paywallGeunhwa)
+    const { postId, digest } = await submitPostOnChain(acct, record?.text, parentId, media, record?.humming?.paywallGeunhwa, record?.langs)
     return {
       uri: `at://${acct.did}/app.bsky.feed.post/${postId}`,
       cid: await fakeCid(digest),
@@ -1025,11 +1043,11 @@ xrpc('post', 'app.humming.creator.becomeCreator', async req => {
     throw e
   }
   // 가드레일: 0.01 ~ 100 HANEUL / 1~365일
-  if (!(price >= 10_000_000 && price <= 100_000_000_000)) fail(400, '구독료는 0.01~100 HANEUL 사이여야 합니다')
-  if (!(periodDays >= 1 && periodDays <= 365)) fail(400, '구독 기간은 1~365일 사이여야 합니다')
-  if (!['open', 'tease', 'lock'].includes(lockMode)) fail(400, 'lockMode는 open/tease/lock 중 하나입니다')
+  if (!(price >= 10_000_000 && price <= 100_000_000_000)) fail(400, 'Subscription price must be between 0.01 and 100 HANEUL')
+  if (!(periodDays >= 1 && periodDays <= 365)) fail(400, 'Subscription period must be between 1 and 365 days')
+  if (!['open', 'tease', 'lock'].includes(lockMode)) fail(400, 'lockMode must be one of open/tease/lock')
   const gate = await loadGateState()
-  if (gate.tierByCreator.has(viewer.address)) fail(400, '이미 크리에이터입니다 (티어 존재)')
+  if (gate.tierByCreator.has(viewer.address)) fail(400, 'Already a creator (tier exists)')
 
   const periodMs = periodDays * 24 * 60 * 60 * 1000
   const name = viewer.handle.split('.')[0]
