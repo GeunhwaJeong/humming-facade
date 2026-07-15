@@ -9,6 +9,7 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { RPC_URL, PKG, NS_PKG, APP_WALLET } from './lib/config.mjs'
+import { verifyJwt, sessionTokens, hashPassword, verifyPassword } from './lib/auth.mjs'
 import { loadKeys, importFromCliKeystore, createWallet, removeWallet } from './lib/keys.mjs'
 import { client } from './lib/client.mjs'
 import {
@@ -158,8 +159,26 @@ try {
     if (!ACCOUNTS.some(x => x.handle === a.handle)) ACCOUNTS.push(a)
   }
 } catch {}
-const persistAccounts = () =>
-  fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(ACCOUNTS.filter(a => a.signup), null, 2))
+// 계정 파일에는 비밀번호 해시가 들어가므로 소유자 전용(0600) — keys.mjs와 동일 규약
+const persistAccounts = () => {
+  fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(ACCOUNTS.filter(a => a.signup), null, 2), {
+    mode: 0o600,
+  })
+  fs.chmodSync(ACCOUNTS_FILE, 0o600)
+}
+// 평문 password → scrypt 해시 1회 마이그레이션. 시드 계정의 소스 리터럴은 데모 공개
+// 비밀번호(E2E·README에 문서화)라 유지하되, 런타임 메모리·디스크에는 해시만 남긴다.
+{
+  let migrated = false
+  for (const a of ACCOUNTS) {
+    if (a.password !== undefined) {
+      a.passwordHash = hashPassword(a.password)
+      delete a.password
+      if (a.signup) migrated = true
+    }
+  }
+  if (migrated) persistAccounts()
+}
 
 // ---- haneulns 온체인 이름 해석 ----
 // HaneulNS 공유 객체 → RegistryKey df → Registry.registry 테이블 ID (부팅 후 1회 조회)
@@ -199,23 +218,25 @@ async function chainNameRecord(handle) {
   }
 }
 
-// ---- fake-but-wellformed JWTs (the app never verifies signatures) ----
-const b64u = obj => Buffer.from(JSON.stringify(obj)).toString('base64url')
-function makeJwt(did, scope) {
-  const now = Math.floor(Date.now() / 1000)
-  return [
-    b64u({ typ: 'JWT', alg: 'HS256' }),
-    b64u({ scope, sub: did, aud: 'did:web:localhost', iat: now, exp: now + 60 * 60 * 24 * 365 }),
-    'humming-facade-sig',
-  ].join('.')
+// ---- 인증: HS256 실서명 JWT (lib/auth) ----
+const httpError = (status, errorName, message) => {
+  const e = new Error(message)
+  e.status = status
+  e.errorName = errorName
+  throw e
 }
+// 토큰이 없으면 익명(null) — 읽기 엔드포인트는 익명 허용. 토큰이 있으면 반드시
+// 유효해야 하며, 위조·변조는 익명으로 강등하지 않고 거부한다. 만료는 400 ExpiredToken —
+// 앱(@atproto/api 에이전트)이 이 에러명을 보고 refreshSession을 자동 호출하는 규약.
 function didFromAuth(req) {
-  const tok = (req.headers.authorization || '').replace(/^Bearer /, '')
-  try {
-    return JSON.parse(Buffer.from(tok.split('.')[1], 'base64url').toString()).sub
-  } catch {
-    return null
-  }
+  const header = req.headers.authorization
+  if (!header) return null
+  const payload = verifyJwt(header.replace(/^Bearer /, ''))
+  if (!payload || payload.scope !== 'com.atproto.access')
+    httpError(401, 'InvalidToken', 'Invalid access token')
+  if (payload.exp <= Math.floor(Date.now() / 1000))
+    httpError(400, 'ExpiredToken', 'Access token has expired')
+  return payload.sub
 }
 
 // ---- chain → lexicon mapping ----
@@ -430,15 +451,14 @@ xrpc('post', 'com.atproto.server.createAccount', async req => {
     address,
     displayName: name,
     description: 'New on Humming',
-    password,
+    passwordHash: hashPassword(password),
     signup: true,
   }
   ACCOUNTS.push(acct)
   persistAccounts()
   console.log(`🐣 가입: ${acct.handle} → 지갑 ${acct.address.slice(0, 10)}… (온체인 leaf 등록)`)
   return {
-    accessJwt: makeJwt(acct.did, 'com.atproto.access'),
-    refreshJwt: makeJwt(acct.did, 'com.atproto.refresh'),
+    ...sessionTokens(acct.did),
     handle: acct.handle,
     did: acct.did,
   }
@@ -447,15 +467,15 @@ xrpc('post', 'com.atproto.server.createAccount', async req => {
 xrpc('post', 'com.atproto.server.createSession', req => {
   const { identifier, password } = req.body
   const acct = byHandle(identifier)
-  if (!acct || password !== acct.password) {
+  // 계정 부재와 비밀번호 불일치를 구분하지 않음 — 계정 존재 여부 누설 방지
+  if (!acct || !verifyPassword(password, acct.passwordHash)) {
     const e = new Error('Invalid identifier or password')
     e.status = 401
     throw e
   }
   console.log(`✅ 로그인: ${acct.handle}`)
   return {
-    accessJwt: makeJwt(acct.did, 'com.atproto.access'),
-    refreshJwt: makeJwt(acct.did, 'com.atproto.refresh'),
+    ...sessionTokens(acct.did),
     handle: acct.handle,
     did: acct.did,
     email: `${acct.handle.split('.')[0]}@humming.local`,
@@ -464,11 +484,17 @@ xrpc('post', 'com.atproto.server.createSession', req => {
   }
 })
 
+// refresh 스코프 토큰만 수용 — access 토큰으로 세션을 연장할 수 없다
 xrpc('post', 'com.atproto.server.refreshSession', req => {
-  const acct = byDid(didFromAuth(req)) || ACCOUNTS[0]
+  const payload = verifyJwt((req.headers.authorization || '').replace(/^Bearer /, ''))
+  if (!payload || payload.scope !== 'com.atproto.refresh')
+    httpError(401, 'InvalidToken', 'Valid refresh token required')
+  if (payload.exp <= Math.floor(Date.now() / 1000))
+    httpError(400, 'ExpiredToken', 'Refresh token has expired')
+  const acct = byDid(payload.sub)
+  if (!acct) httpError(401, 'InvalidToken', 'Unknown account')
   return {
-    accessJwt: makeJwt(acct.did, 'com.atproto.access'),
-    refreshJwt: makeJwt(acct.did, 'com.atproto.refresh'),
+    ...sessionTokens(acct.did),
     handle: acct.handle,
     did: acct.did,
     active: true,
@@ -476,7 +502,7 @@ xrpc('post', 'com.atproto.server.refreshSession', req => {
 })
 
 xrpc('get', 'com.atproto.server.getSession', req => {
-  const acct = byDid(didFromAuth(req)) || ACCOUNTS[0]
+  const acct = requireAuthAcct(req)
   return {
     did: acct.did,
     handle: acct.handle,
@@ -788,7 +814,9 @@ app.post(
       res.json({ blob: { $type: 'blob', ref: { $link: cid }, mimeType: mime, size: bytes.length } })
     } catch (e) {
       console.error('[uploadBlob] ERROR:', e.message)
-      res.status(500).json({ error: 'InternalServerError', message: e.message })
+      res
+        .status(e.status || 500)
+        .json({ error: e.errorName || 'InternalServerError', message: e.message })
     }
   },
 )

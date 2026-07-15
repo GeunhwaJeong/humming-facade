@@ -6,6 +6,8 @@ accounts.json
 media/
 # 지갑 비밀키 (수탁 데모) — 절대 커밋 금지
 wallet-keys.json
+# JWT 서명 시크릿 (부팅 시 자동 생성) — 절대 커밋 금지
+.jwt-secret
 
 # 세션 임시 파일
 *.log
