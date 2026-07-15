@@ -545,7 +545,11 @@ async function detailedProfile(actorParam) {
 xrpc('get', 'app.bsky.actor.getProfile', req => detailedProfile(req.query.actor))
 xrpc('get', 'app.bsky.actor.getProfiles', async req => {
   const actors = [].concat(req.query.actors || [])
-  return { profiles: await Promise.all(actors.map(detailedProfile)) }
+  // 계정 전환기가 브라우저에 저장된 전 계정을 한 번에 조회한다 — 지난 체인(regenesis
+  // 이전)의 계정 등 모르는 actor가 섞여도 전체를 실패시키지 않고 아는 것만 반환
+  // (실제 appview와 동일한 관용 동작)
+  const profiles = await Promise.all(actors.map(a => detailedProfile(a).catch(() => null)))
+  return { profiles: profiles.filter(Boolean) }
 })
 xrpc('get', 'app.bsky.actor.getPreferences', () => ({
   preferences: [
