@@ -8,7 +8,7 @@ import { sha256 } from 'multiformats/hashes/sha2'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { RPC_URL, PKG, NS_PKG, APP_WALLET } from './lib/config.mjs'
+import { RPC_URL, PKG, NS_PKG, APP_WALLET, HANEUL_TYPE } from './lib/config.mjs'
 import { verifyJwt, sessionTokens, hashPassword, verifyPassword } from './lib/auth.mjs'
 import { loadKeys, importFromCliKeystore, createWallet, removeWallet } from './lib/keys.mjs'
 import { client } from './lib/client.mjs'
@@ -1135,6 +1135,54 @@ xrpc('get', 'app.humming.creator.getEarnings', async req => {
   totals.totalGeunhwa = totals.subscriptionGeunhwa + totals.tipGeunhwa + totals.purchaseGeunhwa
   const tier = gate.tierByCreator.get(viewer.address) || null
   return { totals, items: items.slice(0, 30), tier, isCreator: !!tier }
+})
+
+// --- app.humming.wallet: 지갑 패널 — "가입=지갑"을 UI에 드러내는 읽기 전용 뷰 ---
+// 주소·잔고·최근 온체인 활동만 반환한다. 보내기(임의 이체 서명)는 의도적으로 없음:
+// 수탁 파사드가 이체까지 서명하면 리스크 표면이 커지므로 비수탁 전환(패스키) 후에만.
+xrpc('get', 'app.humming.wallet.getInfo', async req => {
+  const viewer = requireAuthAcct(req)
+  const [{ totalBalance }, posts, gate] = await Promise.all([
+    client.getBalance({ owner: viewer.address, coinType: HANEUL_TYPE }),
+    loadPosts(),
+    loadGateState(),
+  ])
+  const authorOf = postId => posts.find(p => p.postId === String(postId))?.author.address
+  const nameOf = addr => byAddress(addr)?.handle ?? `${addr.slice(0, 8)}…`
+  // 인덱서 수익 원장(제네시스부터 전량)에서 내가 당사자인 이체를 양방향으로 추림.
+  // 나가는 돈은 gross(내가 낸 금액), 들어오는 돈은 net(수수료 차감 후 실수령)이 진실.
+  const items = []
+  for (const e of chainState.earnings) {
+    const p = e.parsedJson
+    const gross = Number(p.amount)
+    const net = gross - Number(p.fee)
+    const base = { atMs: e.timestampMs, tx: e.txDigest }
+    if (e.shortType === 'subscriptions::Subscribed') {
+      const creatorAddr = gate.tierInfo.get(p.tier)?.creator
+      if (p.subscriber === viewer.address)
+        items.push({ kind: 'subscription', direction: 'out', counterparty: nameOf(creatorAddr ?? ''), amountGeunhwa: gross, ...base })
+      else if (creatorAddr === viewer.address)
+        items.push({ kind: 'subscription', direction: 'in', counterparty: nameOf(p.subscriber), amountGeunhwa: net, ...base })
+    } else if (e.shortType === 'tips::TipSent') {
+      if (p.from === viewer.address)
+        items.push({ kind: 'tip', direction: 'out', counterparty: nameOf(p.to), amountGeunhwa: gross, ...base })
+      else if (p.to === viewer.address)
+        items.push({ kind: 'tip', direction: 'in', counterparty: nameOf(p.from), amountGeunhwa: net, ...base })
+    } else if (e.shortType === 'paid_posts::PostPurchased') {
+      const author = authorOf(p.post_id)
+      if (p.buyer === viewer.address)
+        items.push({ kind: 'purchase', direction: 'out', counterparty: nameOf(author ?? ''), amountGeunhwa: gross, ...base })
+      else if (author === viewer.address)
+        items.push({ kind: 'purchase', direction: 'in', counterparty: nameOf(p.buyer), amountGeunhwa: net, ...base })
+    }
+  }
+  items.sort((a, b) => b.atMs - a.atMs)
+  return {
+    address: viewer.address,
+    handle: viewer.handle,
+    balanceGeunhwa: Number(totalBalance),
+    activity: items.slice(0, 20),
+  }
 })
 
 // --- catch-all: log what the app asks for, fail soft ---
