@@ -10,7 +10,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  RPC_URL, IS_LOCALNET, MAINNET_CHAIN_ID, PKG, NS_PKG, APP_WALLET, HANEUL_TYPE,
+  NETWORK, RPC_URL, IS_LOCALNET, MAINNET_CHAIN_ID, PKG, NS_PKG, APP_WALLET, HANEUL_TYPE,
+  DENY_RESERVED_TABLE, DENY_BLOCKED_TABLE,
 } from './lib/config.mjs'
 import { verifyJwt, sessionTokens, hashPassword, verifyPassword, DUMMY_HASH } from './lib/auth.mjs'
 import { rateLimit } from './lib/ratelimit.mjs'
@@ -165,8 +166,12 @@ const byHandle = h => ACCOUNTS.find(a => a.handle === h || a.did === h)
 const byAddress = addr => ACCOUNTS.find(a => a.address === addr)
 const byDid = d => ACCOUNTS.find(a => a.did === d)
 
-// 가입으로 생긴 계정은 accounts.json으로 존속 (재시작 생존; 시드 계정과 병합)
-const ACCOUNTS_FILE = new URL('./accounts.json', import.meta.url)
+// 가입으로 생긴 계정은 accounts 파일로 존속 (재시작 생존; 시드 계정과 병합).
+// 네트워크별 분리 — 로컬넷 regenesis 청소가 메인넷 계정 파일을 건드리지 못하게 한다.
+const ACCOUNTS_FILE = new URL(
+  NETWORK === 'mainnet' ? './accounts.mainnet.json' : './accounts.json',
+  import.meta.url,
+)
 try {
   for (const a of JSON.parse(fs.readFileSync(ACCOUNTS_FILE, 'utf8'))) {
     if (!ACCOUNTS.some(x => x.handle === a.handle)) ACCOUNTS.push(a)
@@ -226,6 +231,22 @@ if (IS_LOCALNET) {
   }
 }
 
+// 역방향 검증: NETWORK=mainnet 설정이면 실체인도 메인넷이어야 한다 — 메인넷 주소
+// 상수를 엉뚱한 체인에 대고 서빙하면 조용히 빈 인덱스로 뜨는 것을 부팅 실패로 바꾼다.
+if (NETWORK === 'mainnet') {
+  let chainId = null
+  try {
+    chainId = await client.getChainIdentifier()
+  } catch (e) {
+    console.error(`❌ 체인 식별자 확인 실패(${RPC_URL}): ${e.message} — 메인넷 RPC를 확인하세요.`)
+    process.exit(1)
+  }
+  if (chainId !== MAINNET_CHAIN_ID) {
+    console.error(`❌ HUMMING_NETWORK=mainnet 인데 ${RPC_URL} 의 체인은 ${chainId} 입니다.`)
+    process.exit(1)
+  }
+}
+
 // 평문 password → scrypt 해시 1회 마이그레이션. 시드 계정의 소스 리터럴은 데모 공개
 // 비밀번호(E2E·README에 문서화)라 유지하되, 런타임 메모리·디스크에는 해시만 남긴다.
 {
@@ -259,6 +280,20 @@ async function getNsRegistryTable() {
   const obj = await client.getObject({ id: reg.objectId, options: { showContent: true } })
   nsRegistryTable = deepFind(obj.data.content.fields, 'registry').fields.id.id
   return nsRegistryTable
+}
+// 메인넷 denylist — reserved(브랜드·시스템 예약 3,824)·blocked(피싱·유해 36) 라벨 가입 거부.
+// 온체인 new_leaf는 NFT 소유자 발급 경로라 denylist를 강제하지 않음 — 파사드가 집행 지점.
+// 조회 실패는 거부로 처리(fail-closed): 확인 못 한 이름을 발급하지 않는다.
+async function isDeniedName(label) {
+  if (!DENY_RESERVED_TABLE) return false
+  for (const table of [DENY_BLOCKED_TABLE, DENY_RESERVED_TABLE]) {
+    const res = await client.getDynamicFieldObject({
+      parentId: table,
+      name: { type: '0x1::string::String', value: label },
+    })
+    if (res?.data) return true
+  }
+  return false
 }
 // 'grace.hum.haneul' → 레지스트리 테이블에서 NameRecord 조회 (labels는 TLD-first)
 async function chainNameRecord(handle) {
@@ -546,6 +581,7 @@ xrpc('post', 'com.atproto.server.createAccount', async req => {
     fail(400, 'InvalidHandle', 'Nicknames must be 3-30 characters of lowercase letters, digits, or hyphens')
   if (byHandle(h)) fail(400, 'HandleNotAvailable', 'This nickname is already taken')
   if (await chainNameRecord(h)) fail(400, 'HandleNotAvailable', 'This nickname is already registered on-chain')
+  if (await isDeniedName(name)) fail(400, 'HandleNotAvailable', 'This nickname is reserved')
 
   // ① 새 지갑 — 인프로세스 키 생성, 파사드 키 저장소에 등록 (비수탁 전환 전까지의 수탁 데모)
   const { address } = createWallet()

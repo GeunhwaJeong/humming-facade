@@ -11,3 +11,5 @@ wallet-keys.json
 
 # 세션 임시 파일
 *.log
+accounts.mainnet.json
+wallet-keys.mainnet.json
