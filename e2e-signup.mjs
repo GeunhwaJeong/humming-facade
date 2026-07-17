@@ -5,8 +5,8 @@ import { chromium } from 'playwright'
 
 const APP = process.env.APP_URL || 'http://localhost:19006'
 const RPC = 'http://127.0.0.1:9000'
-const NS = '0x5d3f16092b9acf8c6d2e1ccd1c27f16783d75a2203675d7907727ad886a9269a'
-const REGISTRY_TABLE = '0x38111f4edf1ecd43172ec86e2398142448e38cd32ebdf68219ca2ab9da1270c7'
+const NS = '0x83b4ab9ceeae9463799fa695127597853f6fedfaada96159e26ef7364eb95fef'
+const REGISTRY_TABLE = '0x5af6d3e3b24c0c852943b1c964285b838baf3f63453977854710cd6b50f4ff32'
 const NAME = process.env.SIGNUP_NAME || 'sora'
 const PASSWORD = 'humming123'
 const SHOT = n => `/Users/jeong-gh/humming-facade/e2e-signup-${n}.png`
