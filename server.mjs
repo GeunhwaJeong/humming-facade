@@ -8,8 +8,10 @@ import { sha256 } from 'multiformats/hashes/sha2'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { RPC_URL, PKG, NS_PKG, APP_WALLET, HANEUL_TYPE } from './lib/config.mjs'
-import { verifyJwt, sessionTokens, hashPassword, verifyPassword } from './lib/auth.mjs'
+import { fileURLToPath } from 'node:url'
+import { RPC_URL, IS_LOCALNET, PKG, NS_PKG, APP_WALLET, HANEUL_TYPE } from './lib/config.mjs'
+import { verifyJwt, sessionTokens, hashPassword, verifyPassword, DUMMY_HASH } from './lib/auth.mjs'
+import { rateLimit } from './lib/ratelimit.mjs'
 import { loadKeys, importFromCliKeystore, createWallet, removeWallet } from './lib/keys.mjs'
 import { client } from './lib/client.mjs'
 import {
@@ -20,11 +22,14 @@ import {
   state as chainState, stateVersion, gateView, backfill, startPolling, stats,
 } from './lib/indexer.mjs'
 
-const PORT = 3025
+const PORT = Number(process.env.PORT ?? 3025)
+// 미디어 서명 URL에 박히는 외부 노출 주소 — 배포 시 HUMMING_PUBLIC_URL 필수(부팅 가드가 강제)
+const PUBLIC_URL = (process.env.HUMMING_PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/+$/, '')
 
 // ---- 미디어 저장소: 콘텐츠는 오프체인, 체인에는 CID 포인터만 ----
 // 파일 삭제 = 콘텐츠 삭제 가능(법적 요건), 체인의 CID는 존재 증명만 남음
-const MEDIA_DIR = '/Users/jeong-gh/humming-facade/media'
+const MEDIA_DIR =
+  process.env.HUMMING_MEDIA_DIR || fileURLToPath(new URL('./media', import.meta.url))
 fs.mkdirSync(MEDIA_DIR, { recursive: true })
 // 서명 비밀키는 프로세스 수명 — URL은 요청마다 새로 발급되므로 재시작 무해
 const MEDIA_SECRET = crypto.randomBytes(32)
@@ -34,7 +39,7 @@ const signMedia = (cid, exp) =>
 // 열람 자격이 확인된 응답에만 실리는 만료형 서명 URL
 function mediaUrl(cid) {
   const exp = Date.now() + MEDIA_URL_TTL_MS
-  return `http://localhost:${PORT}/media/${cid}?exp=${exp}&sig=${signMedia(cid, exp)}`
+  return `${PUBLIC_URL}/media/${cid}?exp=${exp}&sig=${signMedia(cid, exp)}`
 }
 
 // content_uri 인코딩: 본문 뒤에 미디어 포인터·언어 태그를 덧붙임 (CID 전달 규약)
@@ -166,13 +171,33 @@ const persistAccounts = () => {
   })
   fs.chmodSync(ACCOUNTS_FILE, 0o600)
 }
+// ---- 배포 가드: 로컬넷 밖으로는 데모 전제를 하나도 끌고 나가지 못하게 한다 ----
+// 시드 계정 비밀번호('humming')는 README·E2E에 공개된 값 — 실 체인에서 이 계정으로
+// 부팅하면 임의의 공격자가 로그인해 지갑을 드레인할 수 있으므로 부팅 자체를 거부한다.
+if (!IS_LOCALNET) {
+  const fatal = []
+  if (ACCOUNTS.some(a => a.password !== undefined))
+    fatal.push(
+      '시드 계정이 소스에 공개된 비밀번호를 갖고 있습니다 — ACCOUNTS의 데모 계정을 제거하세요.',
+    )
+  if (!process.env.HUMMING_PUBLIC_URL)
+    fatal.push('HUMMING_PUBLIC_URL 미설정 — 미디어 서명 URL이 localhost로 발급되어 전부 404가 됩니다.')
+  if (!process.env.HUMMING_APP_ORIGINS)
+    fatal.push('HUMMING_APP_ORIGINS 미설정 — CORS가 모든 origin을 반사합니다. 앱 origin을 콤마로 지정하세요.')
+  if (fatal.length) {
+    console.error(`❌ 비로컬넷 체인(${RPC_URL})으로 부팅 거부:`)
+    for (const m of fatal) console.error(`   - ${m}`)
+    process.exit(1)
+  }
+}
+
 // 평문 password → scrypt 해시 1회 마이그레이션. 시드 계정의 소스 리터럴은 데모 공개
 // 비밀번호(E2E·README에 문서화)라 유지하되, 런타임 메모리·디스크에는 해시만 남긴다.
 {
   let migrated = false
   for (const a of ACCOUNTS) {
     if (a.password !== undefined) {
-      a.passwordHash = hashPassword(a.password)
+      a.passwordHash = await hashPassword(a.password)
       delete a.password
       if (a.signup) migrated = true
     }
@@ -387,8 +412,63 @@ async function loadPostsFor(req) {
 
 // ---- server ----
 const app = express()
-app.use(cors({ origin: true, allowedHeaders: '*', exposedHeaders: '*' }))
+// 리버스 프록시(nginx 등) 뒤에서만 X-Forwarded-For를 신뢰 — 직노출 시 켜면 IP 스푸핑으로
+// 레이트리밋을 우회할 수 있으므로 기본 off, 배포 구성에서 명시적으로 켠다
+if (process.env.HUMMING_TRUST_PROXY === '1') app.set('trust proxy', 1)
+// 배포 가드가 비로컬넷에서 HUMMING_APP_ORIGINS를 강제 — 로컬넷 개발만 전체 반사 허용
+const APP_ORIGINS = (process.env.HUMMING_APP_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean)
+app.use(cors({ origin: APP_ORIGINS.length ? APP_ORIGINS : true, allowedHeaders: '*', exposedHeaders: '*' }))
 app.use(express.json({ limit: '5mb' }))
+
+// ---- ready 게이트: 백필이 끝나기 전엔 아무 XRPC도 응답하지 않는다 (fail-closed) ----
+// 이벤트 타입별 병렬 백필 중엔 PostCreated만 인덱싱되고 PaywallCreated/PrefsChanged가
+// 아직인 창이 생긴다 — 그 창에서 잠금 판정이 false가 되어 유료 본문·서명 미디어 URL이
+// 익명 뷰어에게 누출된다. 제품이 지키겠다고 약속한 바로 그 콘텐츠이므로 503이 정답.
+let chainReady = false
+app.use('/xrpc', (req, res, next) => {
+  if (chainReady) return next()
+  res.setHeader('Retry-After', '2')
+  res.status(503).json({ error: 'ServiceUnavailable', message: 'Warming up: chain index backfill in progress' })
+})
+app.get('/health', (req, res) => {
+  res.status(chainReady ? 200 : 503).json({ ready: chainReady, ...(chainReady && { events: stats() }) })
+})
+
+// ---- 인증 표면 레이트리밋 ----
+// 로컬넷은 리밋을 사실상 풀어 E2E·반복 개발을 막지 않는다 (기제 자체는 동일 코드로 통과).
+// createSession: 커스터디 지갑의 유일한 방벽이 비밀번호 — 무제한 추측을 막는다.
+// per-IP(광역 스캔)와 per-계정(단일 표적 분산 IP) 양쪽에서 조인다.
+const limitOf = (envKey, prod) => Number(process.env[envKey] ?? (IS_LOCALNET ? 10_000 : prod))
+app.use(
+  '/xrpc/com.atproto.server.createSession',
+  rateLimit({ windowMs: 5 * 60_000, max: limitOf('HUMMING_LOGIN_IP_LIMIT', 20) }),
+  rateLimit({
+    windowMs: 15 * 60_000,
+    max: limitOf('HUMMING_LOGIN_ACCT_LIMIT', 10),
+    key: req => (req.body?.identifier ? `acct:${String(req.body.identifier).toLowerCase()}` : null),
+    message: 'Too many login attempts for this account — try again later',
+  }),
+)
+// createAccount: 가입마다 faucet + APP_WALLET 가스가 나가는 지출 엔드포인트 —
+// per-IP에 더해 일일 총량 cap으로 지갑 드레인의 상한을 건다.
+app.use(
+  '/xrpc/com.atproto.server.createAccount',
+  rateLimit({
+    windowMs: 60 * 60_000,
+    max: limitOf('HUMMING_SIGNUP_IP_LIMIT', 5),
+    message: 'Too many signups from this address — try again later',
+  }),
+  rateLimit({
+    windowMs: 24 * 60 * 60_000,
+    max: limitOf('HUMMING_MAX_SIGNUPS_PER_DAY', 200),
+    key: () => 'global',
+    error: 'SignupsPaused',
+    message: 'Signups are paused for today — please come back tomorrow',
+  }),
+)
 
 const implemented = {}
 function xrpc(method, nsid, handler) {
@@ -451,7 +531,7 @@ xrpc('post', 'com.atproto.server.createAccount', async req => {
     address,
     displayName: name,
     description: 'New on Humming',
-    passwordHash: hashPassword(password),
+    passwordHash: await hashPassword(password),
     signup: true,
   }
   ACCOUNTS.push(acct)
@@ -464,11 +544,13 @@ xrpc('post', 'com.atproto.server.createAccount', async req => {
   }
 })
 
-xrpc('post', 'com.atproto.server.createSession', req => {
+xrpc('post', 'com.atproto.server.createSession', async req => {
   const { identifier, password } = req.body
   const acct = byHandle(identifier)
-  // 계정 부재와 비밀번호 불일치를 구분하지 않음 — 계정 존재 여부 누설 방지
-  if (!acct || !verifyPassword(password, acct.passwordHash)) {
+  // 계정 부재와 비밀번호 불일치를 구분하지 않음 — 계정 존재 여부 누설 방지.
+  // 미지 계정도 DUMMY_HASH에 대고 같은 scrypt 비용을 치러 응답 시간마저 동일하다.
+  const ok = await verifyPassword(password, acct?.passwordHash ?? DUMMY_HASH)
+  if (!acct || !ok) {
     const e = new Error('Invalid identifier or password')
     e.status = 401
     throw e
@@ -1196,15 +1278,22 @@ loadKeys()
 const imported = importFromCliKeystore([...ACCOUNTS.map(a => a.address), APP_WALLET])
 if (imported) console.log(`🔑 CLI 키스토어에서 계정 키 ${imported}개 임포트`)
 
-app.listen(PORT, async () => {
-  console.log(`🚀 Humming XRPC 파사드: http://localhost:${PORT}`)
+app.listen(PORT, () => {
+  console.log(`🚀 Humming XRPC 파사드: http://localhost:${PORT} (public: ${PUBLIC_URL})`)
   console.log(`   체인: ${RPC_URL} / 패키지: ${PKG.slice(0, 10)}…`)
+  if (!chainReady) console.log('   ⏳ 백필 완료 전까지 XRPC는 503 (fail-closed)')
+})
+// 백필이 전부 끝나야 서빙 개방(chainReady) — 부분 인덱스로 잠금을 판정하지 않는다.
+// 실패 시 성공할 때까지 재시도: 체인이 내려간 동안 503은 의도된 동작(누출보다 다운타임).
+for (;;) {
   try {
     await backfill()
-    console.log(`   ⛓️  이벤트 백필 완료: ${stats()}`)
+    break
   } catch (e) {
-    // 체인 미가동이면 폴링이 커서부터 이어서 따라잡음 — 서빙은 계속
-    console.error('   ⚠️ 이벤트 백필 실패 (폴링이 재시도):', e.message)
+    console.error('   ⚠️ 이벤트 백필 실패, 5초 후 재시도:', e.message)
+    await new Promise(r => setTimeout(r, 5000))
   }
-  startPolling()
-})
+}
+chainReady = true
+console.log(`   ⛓️  이벤트 백필 완료, 서빙 개방: ${stats()}`)
+startPolling()
