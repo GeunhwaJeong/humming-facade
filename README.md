@@ -27,11 +27,18 @@ node server.mjs   # http://localhost:3025
 
 ## 배포 (로컬넷 밖)
 
-`HUMMING_RPC_URL`이 localhost가 아니면 배포 가드가 작동합니다 — 아래를 만족하지 않으면 부팅을 거부합니다:
+배포 환경에서는 `HUMMING_ENV=production`을 설정하세요 — RPC URL과 무관하게 프로덕션 posture(시드 계정 제외·실 레이트리밋·faucet 미사용)를 강제합니다. URL이 localhost가 아니어도 같은 posture가 적용됩니다.
 
-- **시드 데모 계정 제거**: `server.mjs`의 `ACCOUNTS` 리터럴(공개 비밀번호 `humming`)이 남아 있으면 부팅 불가
-- `HUMMING_PUBLIC_URL` — 미디어 서명 URL에 박히는 외부 주소 (예: `https://humming.social`)
+로컬넷 posture는 부팅 시 실체인의 식별자를 대조한 뒤에만 열립니다: `127.0.0.1`이 실은 메인넷 풀노드(체인 `a0053d9e`)를 가리키고 있으면 부팅을 거부합니다. 체인 식별자 확인이 불가능해도(체인 다운) 로컬넷 posture로는 부팅하지 않습니다.
+
+프로덕션 posture의 부팅 요건 (미충족 시 부팅 거부):
+
+- **시드 데모 계정은 자동 제외**됩니다 (로컬넷 posture 전용). 잔존이 감지되면 부팅 불가
+- `HUMMING_PUBLIC_URL` — 미디어 서명 URL에 박히는 외부 주소 (예: `https://api.humming.social`)
 - `HUMMING_APP_ORIGINS` — CORS 허용 origin 콤마 목록 (예: `https://humming.social`)
+- **APP_WALLET 서명 키** — 가입(이름 발급 + 스타터 가스)을 서명할 키가 지갑 키 저장소에 있어야 합니다
+
+가입 자금: faucet이 없는 체인에서는 가입 시 APP_WALLET이 닉네임 발급과 스타터 가스 지급을 **한 PTB로** 처리합니다. 스타터 금액은 `HUMMING_STARTER_GEUNHWA`(기본 200,000,000 = 0.2 HANEUL, 상한 10 HANEUL)로 튜닝하며, 하루 지출 상한은 `스타터 금액 × HUMMING_MAX_SIGNUPS_PER_DAY`입니다.
 
 그 외 환경변수: `PORT`(기본 3025), `HUMMING_MEDIA_DIR`, `HUMMING_FAUCET_URL`, `HUMMING_TRUST_PROXY=1`(리버스 프록시 뒤에서만), 레이트리밋 튜닝 `HUMMING_LOGIN_IP_LIMIT`(20/5분)·`HUMMING_LOGIN_ACCT_LIMIT`(10/15분)·`HUMMING_SIGNUP_IP_LIMIT`(5/시간)·`HUMMING_MAX_SIGNUPS_PER_DAY`(200). 레이트리밋은 로컬넷에서 사실상 해제되어 E2E를 막지 않습니다.
 

@@ -9,13 +9,15 @@ import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { RPC_URL, IS_LOCALNET, PKG, NS_PKG, APP_WALLET, HANEUL_TYPE } from './lib/config.mjs'
+import {
+  RPC_URL, IS_LOCALNET, MAINNET_CHAIN_ID, PKG, NS_PKG, APP_WALLET, HANEUL_TYPE,
+} from './lib/config.mjs'
 import { verifyJwt, sessionTokens, hashPassword, verifyPassword, DUMMY_HASH } from './lib/auth.mjs'
 import { rateLimit } from './lib/ratelimit.mjs'
-import { loadKeys, importFromCliKeystore, createWallet, removeWallet } from './lib/keys.mjs'
+import { loadKeys, importFromCliKeystore, createWallet, removeWallet, keypairFor } from './lib/keys.mjs'
 import { client } from './lib/client.mjs'
 import {
-  execTx, faucet,
+  execTx, faucet, buildStarterGas,
   buildNewLeaf, buildCreatePost, buildSubscribe, buildPurchase, buildTip, buildBecomeCreator,
 } from './lib/chain.mjs'
 import {
@@ -25,6 +27,9 @@ import {
 const PORT = Number(process.env.PORT ?? 3025)
 // 미디어 서명 URL에 박히는 외부 노출 주소 — 배포 시 HUMMING_PUBLIC_URL 필수(부팅 가드가 강제)
 const PUBLIC_URL = (process.env.HUMMING_PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/+$/, '')
+// 가입 스타터 가스(GEUNHWA) — faucet 없는 체인에서 APP_WALLET이 새 지갑에 지급하는 초기 금액.
+// 하루 지출 상한 = 이 값 × HUMMING_MAX_SIGNUPS_PER_DAY (기본 0.2 HANEUL × 200 = 40 HANEUL)
+const STARTER_GEUNHWA = BigInt(process.env.HUMMING_STARTER_GEUNHWA ?? 200_000_000)
 
 // ---- 미디어 저장소: 콘텐츠는 오프체인, 체인에는 CID 포인터만 ----
 // 파일 삭제 = 콘텐츠 삭제 가능(법적 요건), 체인의 CID는 존재 증명만 남음
@@ -104,7 +109,9 @@ const mediaCounts = media => ({
 })
 
 // ---- identity: haneulns-style handles mapped to Haneul addresses ----
-const ACCOUNTS = [
+// 시드 데모 계정(공개 비밀번호)은 로컬넷 posture에서만 로드된다 — 배포 시 소스 편집 없이
+// 구조적으로 제외되고, 아래 배포 가드가 잔존 여부를 이중으로 확인한다.
+const SEED_ACCOUNTS = [
   {
     handle: 'bob.hum.haneul',
     did: 'did:web:bob.hum.haneul',
@@ -153,6 +160,7 @@ const ACCOUNTS = [
     password: 'humming',
   },
 ]
+const ACCOUNTS = IS_LOCALNET ? SEED_ACCOUNTS : []
 const byHandle = h => ACCOUNTS.find(a => a.handle === h || a.did === h)
 const byAddress = addr => ACCOUNTS.find(a => a.address === addr)
 const byDid = d => ACCOUNTS.find(a => a.did === d)
@@ -184,9 +192,36 @@ if (!IS_LOCALNET) {
     fatal.push('HUMMING_PUBLIC_URL 미설정 — 미디어 서명 URL이 localhost로 발급되어 전부 404가 됩니다.')
   if (!process.env.HUMMING_APP_ORIGINS)
     fatal.push('HUMMING_APP_ORIGINS 미설정 — CORS가 모든 origin을 반사합니다. 앱 origin을 콤마로 지정하세요.')
+  // 스폰서 금액 오설정(단위 착오 등)이 그대로 지출 상한이 되는 것을 막는다: 0 초과 ~ 10 HANEUL
+  if (STARTER_GEUNHWA <= 0n || STARTER_GEUNHWA > 10_000_000_000n)
+    fatal.push(
+      `HUMMING_STARTER_GEUNHWA=${STARTER_GEUNHWA} — 가입 스타터 금액은 GEUNHWA 단위로 0 초과 10 HANEUL 이하여야 합니다.`,
+    )
   if (fatal.length) {
     console.error(`❌ 비로컬넷 체인(${RPC_URL})으로 부팅 거부:`)
     for (const m of fatal) console.error(`   - ${m}`)
+    process.exit(1)
+  }
+}
+
+// ---- 체인 정체성 가드: URL이 localhost라는 것과 그 뒤가 로컬넷이라는 것은 다른 명제 ----
+// 파사드를 메인넷 풀노드와 같은 박스에 두면 127.0.0.1이 곧 메인넷이다. 로컬넷 posture
+// (시드 계정·완화된 리밋·faucet·CORS 개방)는 체인 식별자를 실제로 확인한 뒤에만 연다.
+// 확인 자체가 안 되면(체인 다운) 열지 않는다 — 잘못된 posture로 서빙하느니 부팅 실패가 낫다.
+if (IS_LOCALNET) {
+  let chainId = null
+  try {
+    chainId = await client.getChainIdentifier()
+  } catch (e) {
+    console.error(`❌ 체인 식별자 확인 실패(${RPC_URL}): ${e.message}`)
+    console.error('   로컬넷 posture는 체인을 확인한 뒤에만 엽니다 — 로컬넷이 떠 있는지 확인하세요.')
+    console.error('   배포 환경이라면 HUMMING_ENV=production 을 설정하세요.')
+    process.exit(1)
+  }
+  if (chainId === MAINNET_CHAIN_ID) {
+    console.error(`❌ ${RPC_URL} 은 localhost지만 그 뒤의 체인은 메인넷(${chainId})입니다.`)
+    console.error('   시드 계정·완화된 레이트리밋을 메인넷에 노출할 수 없어 부팅을 거부합니다.')
+    console.error('   HUMMING_ENV=production 을 설정하고 배포 요건(README)을 채워 다시 시작하세요.')
     process.exit(1)
   }
 }
@@ -515,11 +550,19 @@ xrpc('post', 'com.atproto.server.createAccount', async req => {
   // ① 새 지갑 — 인프로세스 키 생성, 파사드 키 저장소에 등록 (비수탁 전환 전까지의 수탁 데모)
   const { address } = createWallet()
   try {
-    // ② 가스 지급 (로컬넷 faucet; 메인넷에선 스폰서드 tx로 대체)
-    await faucet(address)
-    // ③ 닉네임 발급 — hum.haneul 부모 NFT 소유자(앱 지갑)가 서명·가스 부담.
-    //    APP_WALLET 서명 tx끼리만 직렬화되고 다른 지갑의 결제와는 병렬
-    await execTx(APP_WALLET, buildNewLeaf(h, address))
+    if (IS_LOCALNET) {
+      // ② 가스 지급(로컬넷 faucet) ③ 닉네임 발급 — hum.haneul 부모 NFT 소유자(앱 지갑)가
+      //    서명·가스 부담. APP_WALLET 서명 tx끼리만 직렬화되고 다른 지갑의 결제와는 병렬
+      await faucet(address)
+      await execTx(APP_WALLET, buildNewLeaf(h, address))
+    } else {
+      // faucet 없는 체인: 닉네임 발급 + 스타터 가스를 APP_WALLET의 한 PTB로 원자 처리 —
+      // "이름만 등록된 무가스 지갑" 부분 실패 창이 없고, 지출 상한은 가입 레이트리밋이 건다
+      await execTx(APP_WALLET, tx => {
+        buildNewLeaf(h, address)(tx)
+        buildStarterGas(address, STARTER_GEUNHWA)(tx)
+      })
+    }
   } catch (e) {
     // 온체인 등록 실패(동시 가입으로 leaf 선점 등) → 방금 만든 키 롤백, 고아 키 방지
     removeWallet(address)
@@ -1285,6 +1328,13 @@ app.all('/xrpc/:nsid', (req, res) => {
 loadKeys()
 const imported = importFromCliKeystore([...ACCOUNTS.map(a => a.address), APP_WALLET])
 if (imported) console.log(`🔑 CLI 키스토어에서 계정 키 ${imported}개 임포트`)
+// 앱 지갑 키가 없으면 가입(이름 발급·스타터 가스)이 전부 실패한다 —
+// 첫 유저의 500이 아니라 부팅이 알아채게 한다 (로컬넷은 키스토어 자동 임포트에 맡김)
+if (!IS_LOCALNET && !keypairFor(APP_WALLET)) {
+  console.error('❌ APP_WALLET 서명 키가 지갑 키 저장소에 없습니다 — 가입 처리가 불가능합니다.')
+  console.error(`   ${APP_WALLET} 키를 wallet-keys.json에 넣거나 CLI 키스토어에서 임포트되게 하세요.`)
+  process.exit(1)
+}
 
 app.listen(PORT, () => {
   console.log(`🚀 Humming XRPC 파사드: http://localhost:${PORT} (public: ${PUBLIC_URL})`)
