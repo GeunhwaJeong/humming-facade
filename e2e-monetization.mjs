@@ -4,7 +4,7 @@ import { chromium } from 'playwright'
 
 const APP = process.env.APP_URL || 'http://localhost:19006'
 const RPC = 'http://127.0.0.1:9000'
-const ALICE = '0xa5a8018f9eea5421ff6e9001bb0b8b502e5dd8d40265c38b728c3a1f5e5cf3f0'
+const ALICE = '0x454b30d5ca6c69048cf050368d3bf3c75fd7ed32427ac1c24b9d696dba9bd1a7' // erin — 이 체인에서 bob 미구독 팬
 const BOB = '0x8af0079f1c61849b3c5563ba123ed5413fcc05c8963fd0ecf81bd8220b067014'
 const SHOT = n => `/Users/jeong-gh/humming-facade/e2e-${n}.png`
 
@@ -51,7 +51,7 @@ const serviceText = await page.locator(tid('selectServiceButton')).innerText().c
 console.log('   프로바이더 표시:', serviceText.replace(/\n/g, ' '))
 
 console.log('3) alice.hum.haneul 로그인')
-await page.fill(tid('loginUsernameInput'), 'alice.hum.haneul')
+await page.fill(tid('loginUsernameInput'), 'erin.hum.haneul')
 await page.fill(tid('loginPasswordInput'), 'humming')
 await page.click(tid('loginNextButton'))
 
@@ -82,7 +82,7 @@ await page.screenshot({ path: SHOT('4-subscribed-toast') })
 
 console.log('7) 구독 후: 버튼 상태 전환 + 프리미엄 글 해제')
 await page.waitForSelector(tid('hummingSubscribedBtn'), { timeout: 30000 })
-await page.waitForSelector('text=프리미엄 콘텐츠', { timeout: 30000 })
+await page.waitForSelector('text=구독자 전용 프리미엄 글', { timeout: 30000 })
 console.log('   ✅ "구독 중" 버튼 + 프리미엄 본문 열림')
 await page.waitForTimeout(1500)
 await page.screenshot({ path: SHOT('5-unlocked') })

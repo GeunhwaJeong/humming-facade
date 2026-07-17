@@ -6,7 +6,7 @@ import { chromium } from 'playwright'
 
 const APP = process.env.APP_URL || 'http://localhost:19006'
 const RPC = 'http://127.0.0.1:9000'
-const PKG = '0xb95712343fe388084e0586512b539d0d69fef908f07a0e0ab453a666407c8c0d'
+const PKG = '0xd742c71d4b5b5537319bd461439b4bfee64f464174e1bcb270251a9f826dd914'
 const HANDLE = 'wasabi.hum.haneul'
 const SHOT = n => `/Users/jeong-gh/humming-facade/e2e-creator-${n}.png`
 const tid = id => `[data-testid="${id}"]`
@@ -15,6 +15,8 @@ const acct = JSON.parse(fs.readFileSync(new URL('./accounts.json', import.meta.u
   a => a.handle === HANDLE,
 )
 if (!acct) throw new Error(`${HANDLE} 없음 — 가입 먼저`)
+// 인증 하드닝 후 accounts.json엔 해시만 남음 — E2E 표준 비밀번호를 직접 사용
+acct.password = process.env.E2E_PASSWORD || 'humming123'
 
 async function rpc(method, params) {
   const res = await fetch(RPC, {

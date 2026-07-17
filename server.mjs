@@ -653,6 +653,14 @@ xrpc('get', 'app.bsky.feed.getTimeline', async req => {
   console.log(`📜 getTimeline → 온체인 게시물 ${posts.length}개 서빙`)
   return { feed: posts.map(p => ({ post: p.post })) }
 })
+// 비로그인 랜딩(Discover)이 요청하는 feedgen 뷰 — 어떤 feed URI가 오든
+// 같은 공개 타임라인을 돌려준다(익명 게이팅 동일 적용). 앱의 loggedOutFetch가
+// 여기로 오면서 실제 Bluesky 콘텐츠가 첫 화면에 노출되던 문제의 서버 측 짝.
+xrpc('get', 'app.bsky.feed.getFeed', async req => {
+  const posts = await loadPostsFor(req)
+  console.log(`📜 getFeed(discover) → 온체인 게시물 ${posts.length}개 서빙`)
+  return { feed: posts.map(p => ({ post: p.post })) }
+})
 xrpc('get', 'app.bsky.feed.getAuthorFeed', async req => {
   const acct = byHandle(req.query.actor) || byDid(req.query.actor)
   const posts = await loadPostsFor(req)

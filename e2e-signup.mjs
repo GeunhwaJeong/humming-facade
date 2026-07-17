@@ -5,8 +5,8 @@ import { chromium } from 'playwright'
 
 const APP = process.env.APP_URL || 'http://localhost:19006'
 const RPC = 'http://127.0.0.1:9000'
-const NS = '0x185c3a7352aca4b3e9eca1806c0068482bba74796f2ccbf4ac996b4da8f0d447'
-const REGISTRY_TABLE = '0x0b69f05f2895a743889f057247686ea19197747454b942ca27ce8a96c6a9f1c6'
+const NS = '0x5d3f16092b9acf8c6d2e1ccd1c27f16783d75a2203675d7907727ad886a9269a'
+const REGISTRY_TABLE = '0x38111f4edf1ecd43172ec86e2398142448e38cd32ebdf68219ca2ab9da1270c7'
 const NAME = process.env.SIGNUP_NAME || 'sora'
 const PASSWORD = 'humming123'
 const SHOT = n => `/Users/jeong-gh/humming-facade/e2e-signup-${n}.png`
@@ -76,6 +76,8 @@ const availableCheck = await page
   .catch(() => false)
 console.log('   가용성 체크 표시:', availableCheck ? '✅ available' : '⚠️ 미표시')
 await page.locator(tid('passwordInput')).fill(PASSWORD)
+// 약관 동의 체크박스 — 미체크 시 가입 버튼 비활성 (2026-07-17 추가)
+await page.getByRole('checkbox').first().click()
 await page.screenshot({ path: SHOT('1-nickname-step') })
 await page.locator(tid('nextBtn')).click()
 
