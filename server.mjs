@@ -484,7 +484,11 @@ async function loadPostsFor(req) {
 const app = express()
 // 리버스 프록시(nginx 등) 뒤에서만 X-Forwarded-For를 신뢰 — 직노출 시 켜면 IP 스푸핑으로
 // 레이트리밋을 우회할 수 있으므로 기본 off, 배포 구성에서 명시적으로 켠다
-if (process.env.HUMMING_TRUST_PROXY === '1') app.set('trust proxy', 1)
+// 값 = 신뢰할 프록시 홉 수 (예: Cloudflare→로컬 Caddy→파사드면 2). 미설정이면 불신.
+{
+  const hops = Number(process.env.HUMMING_TRUST_PROXY)
+  if (Number.isInteger(hops) && hops > 0) app.set('trust proxy', hops)
+}
 // 배포 가드가 비로컬넷에서 HUMMING_APP_ORIGINS를 강제 — 로컬넷 개발만 전체 반사 허용
 const APP_ORIGINS = (process.env.HUMMING_APP_ORIGINS || '')
   .split(',')
