@@ -437,10 +437,12 @@ function gatePosts(posts, viewerAcct, gate) {
     const isAuthor = viewer === item.author.address
     const subscribed = !!viewer && gate.isSubscribedTo(viewer, item.author.address)
     const pw = gate.paywallByPost.get(item.postId)
-    const paywallLocked =
-      pw && !isAuthor && !subscribed && !(viewer && gate.purchased.has(`${item.postId}:${viewer}`))
+    const purchasedThis = !!viewer && gate.purchased.has(`${item.postId}:${viewer}`)
+    const paywallLocked = pw && !isAuthor && !subscribed && !purchasedThis
     const prefs = gate.prefsOf(item.author.address)
-    const profileLocked = prefs.locked && !isAuthor && !subscribed
+    // 단건 구매는 전면 잠금도 뚫는다 — 크리에이터가 이 포스트에 개별 가격을
+    // 붙여 판 이상, 구매자에게 안 보여주면 돈만 받고 콘텐츠를 안 준 상태가 된다
+    const profileLocked = prefs.locked && !isAuthor && !subscribed && !purchasedThis
     if (!paywallLocked && !profileLocked) {
       // 자격자에게만 이 시점에 미디어 서명 URL 발급 (캐시엔 embed가 아예 없음 —
       // 잠금의 실체는 "서버가 안 주는 것", 만료형 URL이 캐시에서 썩지도 않음)
