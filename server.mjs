@@ -1,6 +1,6 @@
 // Humming XRPC Facade — serves the Bluesky app from the Haneul chain.
 // The app speaks ATProto XRPC; we answer from humming contract events on localnet.
-// 쓰기 = SDK 인프로세스 서명(lib/chain), 읽기 = 커서 전량 인덱스(lib/indexer).
+// 쓰기 = SDK 인프로세스 서명(lib/chain), 읽기 = 저널·객체 재구성·체크포인트 테일링 인덱스(lib/indexer).
 import express from 'express'
 import cors from 'cors'
 import { CID } from 'multiformats/cid'
@@ -22,7 +22,7 @@ import {
   buildNewLeaf, buildCreatePost, buildSubscribe, buildPurchase, buildTip, buildBecomeCreator,
 } from './lib/chain.mjs'
 import {
-  state as chainState, stateVersion, gateView, backfill, startPolling, stats,
+  state as chainState, stateVersion, gateView, initIndex, startPolling, stats,
 } from './lib/indexer.mjs'
 
 const PORT = Number(process.env.PORT ?? 3025)
@@ -499,10 +499,10 @@ const APP_ORIGINS = (process.env.HUMMING_APP_ORIGINS || '')
 app.use(cors({ origin: APP_ORIGINS.length ? APP_ORIGINS : true, allowedHeaders: '*', exposedHeaders: '*' }))
 app.use(express.json({ limit: '5mb' }))
 
-// ---- ready 게이트: 백필이 끝나기 전엔 아무 XRPC도 응답하지 않는다 (fail-closed) ----
-// 이벤트 타입별 병렬 백필 중엔 PostCreated만 인덱싱되고 PaywallCreated/PrefsChanged가
-// 아직인 창이 생긴다 — 그 창에서 잠금 판정이 false가 되어 유료 본문·서명 미디어 URL이
-// 익명 뷰어에게 누출된다. 제품이 지키겠다고 약속한 바로 그 콘텐츠이므로 503이 정답.
+// ---- ready 게이트: 인덱스 복원이 끝나기 전엔 아무 XRPC도 응답하지 않는다 (fail-closed) ----
+// 복원 도중엔 포스트는 있는데 페이월·프리프가 아직인 창이 생길 수 있다 — 그 창에서
+// 잠금 판정이 false가 되어 유료 본문·서명 미디어 URL이 익명 뷰어에게 누출된다.
+// 제품이 지키겠다고 약속한 바로 그 콘텐츠이므로 503이 정답.
 let chainReady = false
 app.use('/xrpc', (req, res, next) => {
   if (chainReady) return next()
@@ -1366,7 +1366,7 @@ app.all('/xrpc/:nsid', (req, res) => {
   res.status(501).json({ error: 'MethodNotImplemented', message: req.params.nsid })
 })
 
-// ---- 부팅: 키 로드 → 이벤트 전량 백필 → 서빙 시작 → 증분 폴링 ----
+// ---- 부팅: 키 로드 → 저널 리플레이+객체 재구성 → 서빙 시작 → 체크포인트 테일링 ----
 loadKeys()
 const imported = importFromCliKeystore([...ACCOUNTS.map(a => a.address), APP_WALLET])
 if (imported) console.log(`🔑 CLI 키스토어에서 계정 키 ${imported}개 임포트`)
@@ -1381,19 +1381,20 @@ if (!IS_LOCALNET && !keypairFor(APP_WALLET)) {
 app.listen(PORT, () => {
   console.log(`🚀 Humming XRPC 파사드: http://localhost:${PORT} (public: ${PUBLIC_URL})`)
   console.log(`   체인: ${RPC_URL} / 패키지: ${PKG.slice(0, 10)}…`)
-  if (!chainReady) console.log('   ⏳ 백필 완료 전까지 XRPC는 503 (fail-closed)')
+  if (!chainReady) console.log('   ⏳ 인덱스 복원 완료 전까지 XRPC는 503 (fail-closed)')
 })
-// 백필이 전부 끝나야 서빙 개방(chainReady) — 부분 인덱스로 잠금을 판정하지 않는다.
+// 복원이 전부 끝나야 서빙 개방(chainReady) — 부분 인덱스로 잠금을 판정하지 않는다.
 // 실패 시 성공할 때까지 재시도: 체인이 내려간 동안 503은 의도된 동작(누출보다 다운타임).
+// initIndex는 재호출 안전(리플레이·재구성 모두 멱등).
 for (;;) {
   try {
-    await backfill()
+    await initIndex(ACCOUNTS.map(a => a.address))
     break
   } catch (e) {
-    console.error('   ⚠️ 이벤트 백필 실패, 5초 후 재시도:', e.message)
+    console.error('   ⚠️ 인덱스 복원 실패, 5초 후 재시도:', e.message)
     await new Promise(r => setTimeout(r, 5000))
   }
 }
 chainReady = true
-console.log(`   ⛓️  이벤트 백필 완료, 서빙 개방: ${stats()}`)
+console.log(`   ⛓️  인덱스 복원 완료, 서빙 개방: ${stats()}`)
 startPolling()
