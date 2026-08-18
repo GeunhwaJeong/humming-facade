@@ -198,6 +198,10 @@ if (!IS_LOCALNET) {
     fatal.push('HUMMING_PUBLIC_URL 미설정 — 미디어 서명 URL이 localhost로 발급되어 전부 404가 됩니다.')
   if (!process.env.HUMMING_APP_ORIGINS)
     fatal.push('HUMMING_APP_ORIGINS 미설정 — CORS가 모든 origin을 반사합니다. 앱 origin을 콤마로 지정하세요.')
+  if (!process.env.HUMMING_KEYS_PASSPHRASE)
+    fatal.push(
+      'HUMMING_KEYS_PASSPHRASE 미설정 — 수탁 키 저장소가 평문으로 남습니다. 디스크/백업 유출 = 전 유저 자금 드레인.',
+    )
   // 스폰서 금액 오설정(단위 착오 등)이 그대로 지출 상한이 되는 것을 막는다: 0 초과 ~ 10 HANEUL
   if (STARTER_GEUNHWA <= 0n || STARTER_GEUNHWA > 10_000_000_000n)
     fatal.push(
