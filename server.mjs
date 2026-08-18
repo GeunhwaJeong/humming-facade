@@ -15,6 +15,7 @@ import {
 } from './lib/config.mjs'
 import { verifyJwt, sessionTokens, hashPassword, verifyPassword, DUMMY_HASH } from './lib/auth.mjs'
 import { writeFileAtomic } from './lib/atomic.mjs'
+import { noteChange as noteBackupChange, startBackups } from './lib/backup.mjs'
 import { rateLimit } from './lib/ratelimit.mjs'
 import { loadKeys, importFromCliKeystore, createWallet, removeWallet, keypairFor } from './lib/keys.mjs'
 import { client } from './lib/client.mjs'
@@ -184,6 +185,7 @@ const persistAccounts = () => {
   writeFileAtomic(ACCOUNTS_FILE, JSON.stringify(ACCOUNTS.filter(a => a.signup), null, 2), {
     mode: 0o600,
   })
+  noteBackupChange()
 }
 // ---- 배포 가드: 로컬넷 밖으로는 데모 전제를 하나도 끌고 나가지 못하게 한다 ----
 // 시드 계정 비밀번호('humming')는 README·E2E에 공개된 값 — 실 체인에서 이 계정으로
@@ -1374,6 +1376,7 @@ app.all('/xrpc/:nsid', (req, res) => {
 
 // ---- 부팅: 키 로드 → 저널 리플레이+객체 재구성 → 서빙 시작 → 체크포인트 테일링 ----
 loadKeys()
+startBackups()
 const imported = importFromCliKeystore([...ACCOUNTS.map(a => a.address), APP_WALLET])
 if (imported) console.log(`🔑 CLI 키스토어에서 계정 키 ${imported}개 임포트`)
 // 앱 지갑 키가 없으면 가입(이름 발급·스타터 가스)이 전부 실패한다 —

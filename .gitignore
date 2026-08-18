@@ -13,3 +13,6 @@ wallet-keys.json
 *.log
 accounts.mainnet.json
 wallet-keys.mainnet.json
+
+# 상태 백업 스냅샷 (런타임 생성)
+backups/
