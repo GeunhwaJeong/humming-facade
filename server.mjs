@@ -15,6 +15,8 @@ import {
 } from './lib/config.mjs'
 import { verifyJwt, sessionTokens, hashPassword, verifyPassword, DUMMY_HASH } from './lib/auth.mjs'
 import { writeFileAtomic } from './lib/atomic.mjs'
+import { noteChange as noteBackupChange, startBackups } from './lib/backup.mjs'
+import { idempotent, idempotencyKeyFor } from './lib/idempotency.mjs'
 import { rateLimit } from './lib/ratelimit.mjs'
 import { loadKeys, importFromCliKeystore, createWallet, removeWallet, keypairFor } from './lib/keys.mjs'
 import { client } from './lib/client.mjs'
@@ -184,6 +186,7 @@ const persistAccounts = () => {
   writeFileAtomic(ACCOUNTS_FILE, JSON.stringify(ACCOUNTS.filter(a => a.signup), null, 2), {
     mode: 0o600,
   })
+  noteBackupChange()
 }
 // ---- 배포 가드: 로컬넷 밖으로는 데모 전제를 하나도 끌고 나가지 못하게 한다 ----
 // 시드 계정 비밀번호('humming')는 README·E2E에 공개된 값 — 실 체인에서 이 계정으로
@@ -198,6 +201,10 @@ if (!IS_LOCALNET) {
     fatal.push('HUMMING_PUBLIC_URL 미설정 — 미디어 서명 URL이 localhost로 발급되어 전부 404가 됩니다.')
   if (!process.env.HUMMING_APP_ORIGINS)
     fatal.push('HUMMING_APP_ORIGINS 미설정 — CORS가 모든 origin을 반사합니다. 앱 origin을 콤마로 지정하세요.')
+  if (!process.env.HUMMING_KEYS_PASSPHRASE)
+    fatal.push(
+      'HUMMING_KEYS_PASSPHRASE 미설정 — 수탁 키 저장소가 평문으로 남습니다. 디스크/백업 유출 = 전 유저 자금 드레인.',
+    )
   // 스폰서 금액 오설정(단위 착오 등)이 그대로 지출 상한이 되는 것을 막는다: 0 초과 ~ 10 HANEUL
   if (STARTER_GEUNHWA <= 0n || STARTER_GEUNHWA > 10_000_000_000n)
     fatal.push(
@@ -429,6 +436,41 @@ async function loadPosts() {
 // ---- paywall & subscription state — 인덱서의 전량 인메모리 상태에서 파생 ----
 const loadGateState = () => gateView()
 
+// ---- 미디어 소유 바인딩 ----
+// CID는 온체인 공개 데이터라 누구나 수집할 수 있다. 서명 URL 발급을 "그 CID의
+// 소유자가 쓴 게시물"로 한정해, 남의 유료 CID를 자기(잠기지 않은) 글에 embed해
+// 페이월을 우회하는 경로를 차단한다. 소유자 판정은 이중이다:
+//   ① 업로드 시 meta.json에 기록된 owner (이 커밋 이후의 업로드, 근거가 가장 강함)
+//   ② 없으면 체인에서 그 CID가 처음 등장한 게시물의 작성자 (과거 업로드 백필 —
+//      공격자의 embed는 언제나 원본 게시물보다 나중의 post_id를 가지므로 안전)
+const mediaMetaOwners = new Map() // cid → address | null (meta.json 조회 캐시)
+function metaOwnerOf(cid) {
+  if (mediaMetaOwners.has(cid)) return mediaMetaOwners.get(cid)
+  let owner = null
+  try {
+    owner = JSON.parse(fs.readFileSync(path.join(MEDIA_DIR, `${cid}.meta.json`), 'utf8')).owner ?? null
+  } catch {}
+  mediaMetaOwners.set(cid, owner)
+  return owner
+}
+let cidOwnerVersion = -1
+let cidFirstAuthor = new Map() // cid → 첫 등장 게시물의 작성자 주소
+function chainFirstAuthorOf(cid) {
+  if (cidOwnerVersion !== postCacheVersion) {
+    cidFirstAuthor = new Map()
+    // postCache는 최신순 — post_id 오름차순으로 돌며 첫 등장 작성자를 기록
+    for (const item of [...postCache].sort((a, b) => Number(a.postId) - Number(b.postId))) {
+      for (const m of item.media) {
+        if (!cidFirstAuthor.has(m.cid)) cidFirstAuthor.set(m.cid, item.author.address)
+      }
+    }
+    cidOwnerVersion = postCacheVersion
+  }
+  return cidFirstAuthor.get(cid)
+}
+const mediaOwnedBy = (item) =>
+  item.media.filter(m => (metaOwnerOf(m.cid) ?? chainFirstAuthorOf(m.cid)) === item.author.address)
+
 // 비열람 자격 뷰어에게는 본문 대신 잠금 정보를 내려줌.
 // post.humming 마커(구조화)로 humming-app이 네이티브 잠금 카드를 그리고,
 // record.text 대체문은 무수정 Bluesky 클라이언트용 폴백.
@@ -446,9 +488,11 @@ function gatePosts(posts, viewerAcct, gate) {
     const profileLocked = prefs.locked && !isAuthor && !subscribed && !purchasedThis
     if (!paywallLocked && !profileLocked) {
       // 자격자에게만 이 시점에 미디어 서명 URL 발급 (캐시엔 embed가 아예 없음 —
-      // 잠금의 실체는 "서버가 안 주는 것", 만료형 URL이 캐시에서 썩지도 않음)
+      // 잠금의 실체는 "서버가 안 주는 것", 만료형 URL이 캐시에서 썩지도 않음).
+      // 작성자가 소유한 CID만 발급 — 훔쳐온 CID는 조용히 떨어진다
       if (!item.media.length) return item
-      return { ...item, post: { ...item.post, embed: imagesEmbedView(item.media) } }
+      const embed = imagesEmbedView(mediaOwnedBy(item))
+      return embed ? { ...item, post: { ...item.post, embed } } : item
     }
     const tier = gate.tierByCreator.get(item.author.address) || null
     const priceH = pw ? Number(pw.price) / 1e9 : null
@@ -464,7 +508,7 @@ function gatePosts(posts, viewerAcct, gate) {
           previews: prefs.previews,
           priceGeunhwa: pw ? Number(pw.price) : null,
           tier: tier ? { priceGeunhwa: tier.priceGeunhwa, periodMs: tier.periodMs } : null,
-          media: mediaCounts(item.media),
+          media: mediaCounts(mediaOwnedBy(item)),
         },
         record: {
           ...item.post.record,
@@ -988,9 +1032,16 @@ app.post(
       // 실제 PDS와 동일하게 blob CID = raw(0x55) + sha256 — 파일 내용이 곧 주소
       const digest = await sha256.digest(bytes)
       const cid = CID.createV1(0x55, digest).toString()
-      // CID는 내용 주소 — 반쯤 쓰인 블롭이 그 주소로 서빙되는 일이 없게 원자적으로 쓴다
+      // CID는 내용 주소 — 반쯤 쓰인 블롭이 그 주소로 서빙되는 일이 없게 원자적으로 쓴다.
+      // owner는 최초 업로더로 고정: 같은 파일을 나중에 올린 사람이 소유권을 뺏지 못한다
+      let owner = acct.address
+      try {
+        const prev = JSON.parse(fs.readFileSync(path.join(MEDIA_DIR, `${cid}.meta.json`), 'utf8'))
+        if (prev.owner) owner = prev.owner
+      } catch {}
+      mediaMetaOwners.set(cid, owner)
       writeFileAtomic(path.join(MEDIA_DIR, cid), bytes, { mode: 0o644 })
-      writeFileAtomic(path.join(MEDIA_DIR, `${cid}.meta.json`), JSON.stringify({ mime, size: bytes.length }), { mode: 0o644 })
+      writeFileAtomic(path.join(MEDIA_DIR, `${cid}.meta.json`), JSON.stringify({ mime, size: bytes.length, owner }), { mode: 0o644 })
       console.log(`📦 업로드: ${cid.slice(0, 16)}… (${mime}, ${bytes.length}B) by ${acct.handle}`)
       res.json({ blob: { $type: 'blob', ref: { $link: cid }, mimeType: mime, size: bytes.length } })
     } catch (e) {
@@ -1176,10 +1227,18 @@ xrpc('post', 'app.humming.monetization.subscribe', async req => {
     e.status = 400
     throw e
   }
-  const { digest } = await execTx(
-    viewer.address,
-    buildSubscribe(tierId, price, viewer.address),
-    'Subscribed',
+  // 이미 구독 중이면 새 트랜잭션을 만들지 않는다 — 늦은 재시도·중복 제출이
+  // 두 번째 결제가 되는 것을 온체인 상태로 차단 (기간 연장은 만료 후 재구독으로)
+  if (gate.isSubscribedTo(viewer.address, creator.address)) {
+    const expiresMs = Number(gate.subExpiry.get(`${tierId}:${viewer.address}`) || 0) || null
+    return { digest: '', priceGeunhwa: 0, alreadySubscribed: true, expiresMs }
+  }
+  const idem = idempotencyKeyFor(req, viewer.did, 'subscribe', {
+    key: `sub|${viewer.address}|${tierId}`,
+    windowMs: 60_000,
+  })
+  const { digest } = await idempotent(idem.key, idem.windowMs, () =>
+    execTx(viewer.address, buildSubscribe(tierId, price, viewer.address), 'Subscribed'),
   )
   console.log(`💳 구독: ${viewer.handle} → ${creator.handle} (${price / 1e9} HANEUL) tx=${digest}`)
   return { digest, priceGeunhwa: price }
@@ -1202,10 +1261,16 @@ xrpc('post', 'app.humming.monetization.purchasePost', async req => {
     throw e
   }
   const price = Number(pw.price)
-  const { digest } = await execTx(
-    viewer.address,
-    buildPurchase(pw.paywall, price, viewer.address),
-    'PostPurchased',
+  // 이미 구매한 글의 재구매 요청은 새 트랜잭션 없이 종결 — 구매는 영구라 언제나 안전
+  if (gate.purchased.has(`${postId}:${viewer.address}`)) {
+    return { digest: '', priceGeunhwa: 0, postId, alreadyPurchased: true }
+  }
+  const idem = idempotencyKeyFor(req, viewer.did, 'purchasePost', {
+    key: `ppv|${viewer.address}|${postId}`,
+    windowMs: 60_000,
+  })
+  const { digest } = await idempotent(idem.key, idem.windowMs, () =>
+    execTx(viewer.address, buildPurchase(pw.paywall, price, viewer.address), 'PostPurchased'),
   )
   console.log(`🎟️ 단건 구매: ${viewer.handle} → post ${postId} (${price / 1e9} HANEUL) tx=${digest}`)
   return { digest, priceGeunhwa: price, postId }
@@ -1229,10 +1294,15 @@ xrpc('post', 'app.humming.monetization.tip', async req => {
     e.status = 400
     throw e
   }
-  const { digest } = await execTx(
-    viewer.address,
-    buildTip(creator.address, postId, amount, viewer.address),
-    'TipSent',
+  // 팁은 온체인에 자연 멱등성이 없다 — 동일 (발신, 수신, 글, 금액)의 20초 창
+  // 중복만 흡수한다. 의도적 연속 팁은 20초 뒤부터 정상 통과. 클라이언트가
+  // Idempotency-Key를 보내면 그쪽이 우선(창 10분).
+  const idem = idempotencyKeyFor(req, viewer.did, 'tip', {
+    key: `tip|${viewer.address}|${creator.address}|${postId ?? ''}|${amount}`,
+    windowMs: 20_000,
+  })
+  const { digest } = await idempotent(idem.key, idem.windowMs, () =>
+    execTx(viewer.address, buildTip(creator.address, postId, amount, viewer.address), 'TipSent'),
   )
   console.log(`💰 팁: ${viewer.handle} → ${creator.handle}${postId ? ` (post ${postId})` : ''} (${amount / 1e9} HANEUL) tx=${digest}`)
   return { digest, amountGeunhwa: amount }
@@ -1370,6 +1440,7 @@ app.all('/xrpc/:nsid', (req, res) => {
 
 // ---- 부팅: 키 로드 → 저널 리플레이+객체 재구성 → 서빙 시작 → 체크포인트 테일링 ----
 loadKeys()
+startBackups()
 const imported = importFromCliKeystore([...ACCOUNTS.map(a => a.address), APP_WALLET])
 if (imported) console.log(`🔑 CLI 키스토어에서 계정 키 ${imported}개 임포트`)
 // 앱 지갑 키가 없으면 가입(이름 발급·스타터 가스)이 전부 실패한다 —
