@@ -14,6 +14,7 @@ import {
   DENY_RESERVED_TABLE, DENY_BLOCKED_TABLE,
 } from './lib/config.mjs'
 import { verifyJwt, sessionTokens, hashPassword, verifyPassword, DUMMY_HASH } from './lib/auth.mjs'
+import { writeFileAtomic } from './lib/atomic.mjs'
 import { rateLimit } from './lib/ratelimit.mjs'
 import { loadKeys, importFromCliKeystore, createWallet, removeWallet, keypairFor } from './lib/keys.mjs'
 import { client } from './lib/client.mjs'
@@ -178,11 +179,11 @@ try {
   }
 } catch {}
 // 계정 파일에는 비밀번호 해시가 들어가므로 소유자 전용(0600) — keys.mjs와 동일 규약
+// 비밀번호 해시의 단일 원본 — keys.mjs와 같은 이유로 원자적으로 교체한다.
 const persistAccounts = () => {
-  fs.writeFileSync(ACCOUNTS_FILE, JSON.stringify(ACCOUNTS.filter(a => a.signup), null, 2), {
+  writeFileAtomic(ACCOUNTS_FILE, JSON.stringify(ACCOUNTS.filter(a => a.signup), null, 2), {
     mode: 0o600,
   })
-  fs.chmodSync(ACCOUNTS_FILE, 0o600)
 }
 // ---- 배포 가드: 로컬넷 밖으로는 데모 전제를 하나도 끌고 나가지 못하게 한다 ----
 // 시드 계정 비밀번호('humming')는 README·E2E에 공개된 값 — 실 체인에서 이 계정으로
@@ -987,8 +988,9 @@ app.post(
       // 실제 PDS와 동일하게 blob CID = raw(0x55) + sha256 — 파일 내용이 곧 주소
       const digest = await sha256.digest(bytes)
       const cid = CID.createV1(0x55, digest).toString()
-      fs.writeFileSync(path.join(MEDIA_DIR, cid), bytes)
-      fs.writeFileSync(path.join(MEDIA_DIR, `${cid}.meta.json`), JSON.stringify({ mime, size: bytes.length }))
+      // CID는 내용 주소 — 반쯤 쓰인 블롭이 그 주소로 서빙되는 일이 없게 원자적으로 쓴다
+      writeFileAtomic(path.join(MEDIA_DIR, cid), bytes, { mode: 0o644 })
+      writeFileAtomic(path.join(MEDIA_DIR, `${cid}.meta.json`), JSON.stringify({ mime, size: bytes.length }), { mode: 0o644 })
       console.log(`📦 업로드: ${cid.slice(0, 16)}… (${mime}, ${bytes.length}B) by ${acct.handle}`)
       res.json({ blob: { $type: 'blob', ref: { $link: cid }, mimeType: mime, size: bytes.length } })
     } catch (e) {
