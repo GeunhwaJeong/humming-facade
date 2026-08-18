@@ -34,11 +34,14 @@ The localnet posture only opens after the server verifies the actual chain ident
 Boot requirements for the production posture (boot is refused if unmet):
 
 - **Seed demo accounts are excluded automatically** (they exist for the localnet posture only). Boot fails if any remain.
+- `HUMMING_KEYS_PASSPHRASE`: seals the custodial wallet key store with scrypt + AES-256-GCM at rest. A legacy plaintext store is migrated automatically on the first boot with the passphrase set. Losing the passphrase means losing the keys, so store it in a password manager.
 - `HUMMING_PUBLIC_URL`: the external address baked into signed media URLs (e.g. `https://api.humming.social`).
 - `HUMMING_APP_ORIGINS`: comma-separated list of allowed CORS origins (e.g. `https://humming.social`).
 - **An APP_WALLET signing key** must be present in the wallet key store to sign signups (name issuance plus starter gas).
 
 Signup funding: on a chain without a faucet, APP_WALLET handles name issuance and the starter gas grant in a **single PTB** at signup. Tune the starter amount with `HUMMING_STARTER_GEUNHWA` (default 200,000,000 = 0.2 HANEUL, capped at 10 HANEUL). The daily spend ceiling is the starter amount times `HUMMING_MAX_SIGNUPS_PER_DAY`.
+
+State backups: the facade snapshots its durable state (key store, accounts, JWT secret, indexer cursor) into a rotating local directory at boot, every 6 hours, and shortly after any key or account change. Tune with `HUMMING_BACKUP_DIR` (default `./backups`), `HUMMING_BACKUP_KEEP` (default 48), `HUMMING_BACKUP_INTERVAL_MS`, and set `HUMMING_BACKUP_CMD` to replicate each snapshot offsite (the command runs with `HUMMING_BACKUP_PATH` pointing at the new snapshot, e.g. an `rclone copy`). Each snapshot carries a `manifest.json` with per-file SHA-256 hashes; to restore, verify the hashes, copy the files back to the repo root, and restart.
 
 Other environment variables: `PORT` (default 3025), `HUMMING_MEDIA_DIR`, `HUMMING_FAUCET_URL`, `HUMMING_TRUST_PROXY=1` (only behind a reverse proxy), and rate limit tuning: `HUMMING_LOGIN_IP_LIMIT` (20 per 5 min), `HUMMING_LOGIN_ACCT_LIMIT` (10 per 15 min), `HUMMING_SIGNUP_IP_LIMIT` (5 per hour), `HUMMING_MAX_SIGNUPS_PER_DAY` (200). Rate limits are effectively lifted on localnet so they never get in the way of E2E runs.
 
