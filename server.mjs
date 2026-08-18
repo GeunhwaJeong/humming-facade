@@ -16,6 +16,7 @@ import {
 import { verifyJwt, sessionTokens, hashPassword, verifyPassword, DUMMY_HASH } from './lib/auth.mjs'
 import { writeFileAtomic } from './lib/atomic.mjs'
 import { noteChange as noteBackupChange, startBackups } from './lib/backup.mjs'
+import { idempotent, idempotencyKeyFor } from './lib/idempotency.mjs'
 import { rateLimit } from './lib/ratelimit.mjs'
 import { loadKeys, importFromCliKeystore, createWallet, removeWallet, keypairFor } from './lib/keys.mjs'
 import { client } from './lib/client.mjs'
@@ -1226,10 +1227,18 @@ xrpc('post', 'app.humming.monetization.subscribe', async req => {
     e.status = 400
     throw e
   }
-  const { digest } = await execTx(
-    viewer.address,
-    buildSubscribe(tierId, price, viewer.address),
-    'Subscribed',
+  // 이미 구독 중이면 새 트랜잭션을 만들지 않는다 — 늦은 재시도·중복 제출이
+  // 두 번째 결제가 되는 것을 온체인 상태로 차단 (기간 연장은 만료 후 재구독으로)
+  if (gate.isSubscribedTo(viewer.address, creator.address)) {
+    const expiresMs = Number(gate.subExpiry.get(`${tierId}:${viewer.address}`) || 0) || null
+    return { digest: '', priceGeunhwa: 0, alreadySubscribed: true, expiresMs }
+  }
+  const idem = idempotencyKeyFor(req, viewer.did, 'subscribe', {
+    key: `sub|${viewer.address}|${tierId}`,
+    windowMs: 60_000,
+  })
+  const { digest } = await idempotent(idem.key, idem.windowMs, () =>
+    execTx(viewer.address, buildSubscribe(tierId, price, viewer.address), 'Subscribed'),
   )
   console.log(`💳 구독: ${viewer.handle} → ${creator.handle} (${price / 1e9} HANEUL) tx=${digest}`)
   return { digest, priceGeunhwa: price }
@@ -1252,10 +1261,16 @@ xrpc('post', 'app.humming.monetization.purchasePost', async req => {
     throw e
   }
   const price = Number(pw.price)
-  const { digest } = await execTx(
-    viewer.address,
-    buildPurchase(pw.paywall, price, viewer.address),
-    'PostPurchased',
+  // 이미 구매한 글의 재구매 요청은 새 트랜잭션 없이 종결 — 구매는 영구라 언제나 안전
+  if (gate.purchased.has(`${postId}:${viewer.address}`)) {
+    return { digest: '', priceGeunhwa: 0, postId, alreadyPurchased: true }
+  }
+  const idem = idempotencyKeyFor(req, viewer.did, 'purchasePost', {
+    key: `ppv|${viewer.address}|${postId}`,
+    windowMs: 60_000,
+  })
+  const { digest } = await idempotent(idem.key, idem.windowMs, () =>
+    execTx(viewer.address, buildPurchase(pw.paywall, price, viewer.address), 'PostPurchased'),
   )
   console.log(`🎟️ 단건 구매: ${viewer.handle} → post ${postId} (${price / 1e9} HANEUL) tx=${digest}`)
   return { digest, priceGeunhwa: price, postId }
@@ -1279,10 +1294,15 @@ xrpc('post', 'app.humming.monetization.tip', async req => {
     e.status = 400
     throw e
   }
-  const { digest } = await execTx(
-    viewer.address,
-    buildTip(creator.address, postId, amount, viewer.address),
-    'TipSent',
+  // 팁은 온체인에 자연 멱등성이 없다 — 동일 (발신, 수신, 글, 금액)의 20초 창
+  // 중복만 흡수한다. 의도적 연속 팁은 20초 뒤부터 정상 통과. 클라이언트가
+  // Idempotency-Key를 보내면 그쪽이 우선(창 10분).
+  const idem = idempotencyKeyFor(req, viewer.did, 'tip', {
+    key: `tip|${viewer.address}|${creator.address}|${postId ?? ''}|${amount}`,
+    windowMs: 20_000,
+  })
+  const { digest } = await idempotent(idem.key, idem.windowMs, () =>
+    execTx(viewer.address, buildTip(creator.address, postId, amount, viewer.address), 'TipSent'),
   )
   console.log(`💰 팁: ${viewer.handle} → ${creator.handle}${postId ? ` (post ${postId})` : ''} (${amount / 1e9} HANEUL) tx=${digest}`)
   return { digest, amountGeunhwa: amount }
