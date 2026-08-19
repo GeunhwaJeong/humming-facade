@@ -25,7 +25,7 @@ import {
   buildNewLeaf, buildCreatePost, buildSubscribe, buildPurchase, buildTip, buildBecomeCreator,
 } from './lib/chain.mjs'
 import {
-  state as chainState, stateVersion, gateView, initIndex, startPolling, stats,
+  state as chainState, stateVersion, gateView, initIndex, startTailing, stats,
 } from './lib/indexer.mjs'
 
 const PORT = Number(process.env.PORT ?? 3025)
@@ -1470,4 +1470,4 @@ for (;;) {
 }
 chainReady = true
 console.log(`   ⛓️  인덱스 복원 완료, 서빙 개방: ${stats()}`)
-startPolling()
+startTailing()
