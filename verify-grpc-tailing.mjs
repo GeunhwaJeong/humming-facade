@@ -4,7 +4,13 @@
 //      vs gRPC(GetCheckpoint read_mask + checkpointToEvents, 신 테일링 경로)
 //   ② 소크: SubscribeCheckpoints 스트림이 갭 없이 오름차순으로 오는지 N개 관찰
 // 사용: HUMMING_NETWORK=mainnet node verify-grpc-tailing.mjs
-import { client, grpcClient } from './lib/client.mjs'
+// JSON-RPC 클라이언트는 런타임 lib에서 제거됐으므로 비교용으로만 여기서 직접 만든다.
+// 업스트림이 JSON-RPC를 실제로 제거한 노드에서는 이 등가 섹션은 의미를 잃는다(기록용).
+import { HaneulJsonRpcClient } from '@haneullabs/haneul/jsonRpc'
+import { RPC_URL } from './lib/config.mjs'
+import { grpcClient } from './lib/client.mjs'
+
+const client = new HaneulJsonRpcClient({ network: 'localnet', url: RPC_URL })
 import { checkpointToEvents, getCheckpointEvents, serviceInfo, subscribeCheckpoints } from './lib/grpc.mjs'
 
 const ok = (label, cond, detail = '') => {
