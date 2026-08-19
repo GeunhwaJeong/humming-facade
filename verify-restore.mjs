@@ -3,7 +3,7 @@
 // 사용: HUMMING_NETWORK=mainnet node verify-restore.mjs <accounts.json>
 import fs from 'node:fs'
 import { readChainState } from './lib/bootstrap.mjs'
-import { client } from './lib/client.mjs'
+import { serviceInfo, getCheckpointEvents, checkpointToEvents } from './lib/grpc.mjs'
 
 const accountsFile = process.argv[2]
 if (!accountsFile) {
@@ -29,9 +29,13 @@ console.log(`  prefs: ${cs.prefs.length}`)
 for (const pr of cs.prefs)
   console.log(`    ${pr.creator.slice(0, 10)}… locked=${pr.profile_locked} previews=${pr.show_locked_previews}`)
 
-// 체크포인트 테일링 스모크 — 최신 체크포인트 페이지를 실제로 읽어본다
-const tip = Number(await client.getLatestCheckpointSequenceNumber())
-const page = await client.getCheckpoints({ cursor: String(tip - 5), limit: 5, descendingOrder: false })
-const digests = page.data.flatMap(cp => cp.transactions)
-const txs = await client.multiGetTransactionBlocks({ digests: digests.slice(0, 50), options: { showEvents: true } })
-console.log(`테일링 스모크: tip=${tip}, page=${page.data.length}ckpt, txs=${txs.length}, events=${txs.reduce((n, t) => n + (t?.events?.length ?? 0), 0)}`)
+// 체크포인트 테일링 스모크 — 최신 체크포인트 몇 개를 실제로 읽어본다 (gRPC)
+const tip = Number((await serviceInfo()).checkpointHeight)
+let txCount = 0
+let eventCount = 0
+for (let s = tip - 4; s <= tip; s++) {
+  const cp = await getCheckpointEvents(s)
+  txCount += cp.transactions?.length ?? 0
+  eventCount += checkpointToEvents(cp).events.length
+}
+console.log(`테일링 스모크: tip=${tip}, 5ckpt, txs=${txCount}, events=${eventCount}`)
