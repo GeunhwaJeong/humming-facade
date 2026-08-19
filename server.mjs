@@ -19,7 +19,9 @@ import { noteChange as noteBackupChange, startBackups } from './lib/backup.mjs'
 import { idempotent, idempotencyKeyFor } from './lib/idempotency.mjs'
 import { rateLimit } from './lib/ratelimit.mjs'
 import { loadKeys, importFromCliKeystore, createWallet, removeWallet, keypairFor } from './lib/keys.mjs'
-import { client } from './lib/client.mjs'
+import { bcs } from '@haneullabs/haneul/bcs'
+import { grpcClient } from './lib/client.mjs'
+import { chainIdentifier, getObjectJson, listAllDynamicFields } from './lib/grpc.mjs'
 import {
   execTx, faucet, buildStarterGas,
   buildNewLeaf, buildCreatePost, buildSubscribe, buildPurchase, buildTip, buildBecomeCreator,
@@ -224,7 +226,7 @@ if (!IS_LOCALNET) {
 if (IS_LOCALNET) {
   let chainId = null
   try {
-    chainId = await client.getChainIdentifier()
+    chainId = await chainIdentifier()
   } catch (e) {
     console.error(`❌ 체인 식별자 확인 실패(${RPC_URL}): ${e.message}`)
     console.error('   로컬넷 posture는 체인을 확인한 뒤에만 엽니다 — 로컬넷이 떠 있는지 확인하세요.')
@@ -244,7 +246,7 @@ if (IS_LOCALNET) {
 if (NETWORK === 'mainnet') {
   let chainId = null
   try {
-    chainId = await client.getChainIdentifier()
+    chainId = await chainIdentifier()
   } catch (e) {
     console.error(`❌ 체인 식별자 확인 실패(${RPC_URL}): ${e.message} — 메인넷 RPC를 확인하세요.`)
     process.exit(1)
@@ -283,23 +285,40 @@ function deepFind(obj, key) {
 }
 async function getNsRegistryTable() {
   if (nsRegistryTable) return nsRegistryTable
-  const dfs = await client.getDynamicFields({ parentId: NS_OBJ, limit: 20 })
-  const reg = dfs.data.find(d => (d.name?.type || '').includes('::haneulns::RegistryKey<'))
-  const obj = await client.getObject({ id: reg.objectId, options: { showContent: true } })
-  nsRegistryTable = deepFind(obj.data.content.fields, 'registry').fields.id.id
+  const dfs = await listAllDynamicFields(NS_OBJ)
+  // RegistryKey<..denylist::Denylist>도 같은 부모에 있으므로 Registry 본체 키를 정확히 집는다
+  const reg = dfs.find(d => (d.name?.type || '').includes('::registry::Registry>'))
+  const json = await getObjectJson(reg.fieldId)
+  nsRegistryTable = deepFind(json, 'registry').id
   return nsRegistryTable
 }
+// 이름으로 동적 필드 조회 — gRPC에는 이름 조회 RPC가 없어 SDK가 필드 ID를
+// 유도(deriveDynamicFieldID)해 객체를 읽는다. 반환은 필드 객체의 평면 json, 부재는 null.
+async function dynamicFieldId(parentId, nameType, nameBcs) {
+  try {
+    const { dynamicField } = await grpcClient.getDynamicField({
+      parentId,
+      name: { type: nameType, bcs: nameBcs },
+    })
+    return dynamicField.fieldId
+  } catch (e) {
+    if (/not.?found/i.test(String(e?.message))) return null
+    throw e
+  }
+}
+async function dynamicFieldJson(parentId, nameType, nameBcs) {
+  const id = await dynamicFieldId(parentId, nameType, nameBcs)
+  return id ? getObjectJson(id) : null
+}
+const DomainBcs = bcs.struct('Domain', { labels: bcs.vector(bcs.string()) })
 // 메인넷 denylist — reserved(브랜드·시스템 예약 3,824)·blocked(피싱·유해 36) 라벨 가입 거부.
 // 온체인 new_leaf는 NFT 소유자 발급 경로라 denylist를 강제하지 않음 — 파사드가 집행 지점.
 // 조회 실패는 거부로 처리(fail-closed): 확인 못 한 이름을 발급하지 않는다.
 async function isDeniedName(label) {
   if (!DENY_RESERVED_TABLE) return false
+  const name = bcs.string().serialize(label).toBytes()
   for (const table of [DENY_BLOCKED_TABLE, DENY_RESERVED_TABLE]) {
-    const res = await client.getDynamicFieldObject({
-      parentId: table,
-      name: { type: '0x1::string::String', value: label },
-    })
-    if (res?.data) return true
+    if (await dynamicFieldId(table, '0x1::string::String', name)) return true
   }
   return false
 }
@@ -309,13 +328,14 @@ async function chainNameRecord(handle) {
   if (labels.length < 2 || labels[0] !== 'haneul') return null
   try {
     const table = await getNsRegistryTable()
-    const res = await client.getDynamicFieldObject({
-      parentId: table,
-      name: { type: `${NS_PKG}::domain::Domain`, value: { labels } },
-    })
-    const fields = deepFind(res, 'target_address') !== undefined ? res : null
-    if (!fields) return null
-    return { target: deepFind(res, 'target_address') }
+    const rec = await dynamicFieldJson(
+      table,
+      `${NS_PKG}::domain::Domain`,
+      DomainBcs.serialize({ labels }).toBytes(),
+    )
+    const target = deepFind(rec, 'target_address')
+    if (target === undefined) return null
+    return { target }
   } catch {
     return null
   }
@@ -1389,8 +1409,8 @@ xrpc('get', 'app.humming.creator.getEarnings', async req => {
 // 수탁 파사드가 이체까지 서명하면 리스크 표면이 커지므로 비수탁 전환(패스키) 후에만.
 xrpc('get', 'app.humming.wallet.getInfo', async req => {
   const viewer = requireAuthAcct(req)
-  const [{ totalBalance }, posts, gate] = await Promise.all([
-    client.getBalance({ owner: viewer.address, coinType: HANEUL_TYPE }),
+  const [{ balance }, posts, gate] = await Promise.all([
+    grpcClient.getBalance({ owner: viewer.address, coinType: HANEUL_TYPE }),
     loadPosts(),
     loadGateState(),
   ])
@@ -1427,7 +1447,7 @@ xrpc('get', 'app.humming.wallet.getInfo', async req => {
   return {
     address: viewer.address,
     handle: viewer.handle,
-    balanceGeunhwa: Number(totalBalance),
+    balanceGeunhwa: Number(balance.balance),
     activity: items.slice(0, 20),
   }
 })
