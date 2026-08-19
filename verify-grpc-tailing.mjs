@@ -59,9 +59,11 @@ const epoch = (
   await grpcClient.ledgerService.getEpoch({ readMask: { paths: ['epoch', 'first_checkpoint'] } })
 ).response.epoch
 const boundary = Number(epoch.firstCheckpoint)
-const seqs = []
-for (let s = tip - 10; s < tip; s++) seqs.push(s)
-if (boundary - 3 > lowest) for (let s = boundary - 3; s < boundary + 2; s++) seqs.push(s)
+const range = new Set()
+for (let s = tip - 10; s < tip; s++) range.add(s)
+// 에폭 경계가 tip 스냅샷 근처인 짧은 에폭 체인(로컬넷)도 있으므로 가용 구간으로 클램프
+for (let s = boundary - 3; s < boundary + 2; s++) range.add(s)
+const seqs = [...range].filter(s => s > lowest && s <= tip).sort((a, b) => a - b)
 
 let totalEvents = 0
 for (const seq of seqs) {
@@ -78,23 +80,35 @@ for (const seq of seqs) {
 ok('전송 간 이벤트 등가', true, `체크포인트 ${seqs.length}개, 이벤트 ${totalEvents}건 일치`)
 ok('실 이벤트 표본 포함', totalEvents > 0, '(0건이면 parsedJson 변환이 검증되지 않은 것)')
 
-// ② 스트림 소크: 갭 없는 오름차순 커서 + 어댑터 무오류
+// ② 스트림 소크: 갭 없는 오름차순 커서 + 어댑터 무오류.
+// ⚠️ 스트림 이벤트는 type만 있고 json(parsedJson)이 비어 있다 — 노드의 구독
+// 렌더러는 Move 값 JSON 렌더링을 하지 않는다(GetCheckpoint만 한다). 인덱서는
+// 그래서 스트림을 감지용으로만 쓰고 반영 전에 GetCheckpoint로 재조회한다.
+// 여기서는 이벤트가 실린 스트림 체크포인트를 만나면 그 재조회 경로가 온전한
+// parsedJson을 주는지까지 확인한다 (트래픽 없으면 이 검사는 자연히 스킵).
 const SOAK = 20
 const ac = new AbortController()
 const stream = subscribeCheckpoints(ac.signal)
 let prev = null
 let n = 0
+let refetched = 0
 try {
   for await (const resp of stream.responses) {
     const seq = Number(resp.cursor)
     if (prev !== null && seq !== prev + 1) throw new Error(`FAIL: 스트림 갭 ${prev} → ${seq}`)
-    checkpointToEvents(resp.checkpoint) // 어댑터가 스트림 페이로드에서도 무오류인지
+    const detected = checkpointToEvents(resp.checkpoint).events
+    if (detected.length) {
+      const full = checkpointToEvents(await getCheckpointEvents(seq)).events
+      if (full.length !== detected.length || full.some(ev => ev.parsedJson == null))
+        throw new Error(`FAIL: 체크포인트 ${seq} 재조회가 온전한 parsedJson을 주지 않음`)
+      refetched++
+    }
     prev = seq
     if (++n >= SOAK) ac.abort()
   }
 } catch (e) {
   if (!ac.signal.aborted) throw e
 }
-ok('구독 스트림 갭 없음', n >= SOAK, `${n}개 연속 수신 (${prev - SOAK + 1}~${prev})`)
+ok('구독 스트림 갭 없음', n >= SOAK, `${n}개 연속 수신 (${prev - SOAK + 1}~${prev}), 이벤트 재조회 검증 ${refetched}건`)
 
 console.log('\n🎉 전 항목 통과')
