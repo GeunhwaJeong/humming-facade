@@ -14,6 +14,8 @@ import {
   DENY_RESERVED_TABLE, DENY_BLOCKED_TABLE,
 } from './lib/config.mjs'
 import { verifyJwt, sessionTokens, hashPassword, verifyPassword, DUMMY_HASH } from './lib/auth.mjs'
+import { checkNewPassword } from './lib/policy.mjs'
+import { revokeSession, isRevoked, tokenId } from './lib/revocation.mjs'
 import { writeFileAtomic } from './lib/atomic.mjs'
 import { noteChange as noteBackupChange, startBackups } from './lib/backup.mjs'
 import { idempotent, idempotencyKeyFor } from './lib/idempotency.mjs'
@@ -354,9 +356,14 @@ const httpError = (status, errorName, message) => {
 function didFromAuth(req) {
   const header = req.headers.authorization
   if (!header) return null
-  const payload = verifyJwt(header.replace(/^Bearer /, ''))
+  const token = header.replace(/^Bearer /, '')
+  const payload = verifyJwt(token)
   if (!payload || payload.scope !== 'com.atproto.access')
     httpError(401, 'InvalidToken', 'Invalid access token')
+  // deleteSession으로 폐기된 세션의 토큰은 서명이 유효해도 거부한다
+  // (jti 공유 폐기, 구형 무-jti 토큰은 해시로)
+  if (isRevoked(payload.jti) || (!payload.jti && isRevoked(tokenId(token))))
+    httpError(401, 'InvalidToken', 'Session has been revoked')
   if (payload.exp <= Math.floor(Date.now() / 1000))
     httpError(400, 'ExpiredToken', 'Access token has expired')
   return payload.sub
@@ -644,6 +651,9 @@ xrpc('post', 'com.atproto.server.createAccount', async req => {
     throw e
   }
   if (!handle || !password) fail(400, 'InvalidRequest', 'handle and password are required')
+  // 정책은 신규 생성에만 강제한다. 로그인(createSession)에 걸면 기존 유저가 잠긴다.
+  const pwProblem = checkNewPassword(password)
+  if (pwProblem) fail(400, 'InvalidPassword', pwProblem)
   const h = String(handle).toLowerCase()
   if (!h.endsWith('.hum.haneul')) fail(400, 'UnsupportedDomain', 'handle must end with .hum.haneul')
   const name = h.slice(0, -'.hum.haneul'.length)
@@ -718,9 +728,12 @@ xrpc('post', 'com.atproto.server.createSession', async req => {
 
 // refresh 스코프 토큰만 수용 — access 토큰으로 세션을 연장할 수 없다
 xrpc('post', 'com.atproto.server.refreshSession', req => {
-  const payload = verifyJwt((req.headers.authorization || '').replace(/^Bearer /, ''))
+  const token = (req.headers.authorization || '').replace(/^Bearer /, '')
+  const payload = verifyJwt(token)
   if (!payload || payload.scope !== 'com.atproto.refresh')
     httpError(401, 'InvalidToken', 'Valid refresh token required')
+  if (isRevoked(payload.jti) || (!payload.jti && isRevoked(tokenId(token))))
+    httpError(401, 'InvalidToken', 'Session has been revoked')
   if (payload.exp <= Math.floor(Date.now() / 1000))
     httpError(400, 'ExpiredToken', 'Refresh token has expired')
   const acct = byDid(payload.sub)
@@ -731,6 +744,19 @@ xrpc('post', 'com.atproto.server.refreshSession', req => {
     did: acct.did,
     active: true,
   }
+})
+
+// 로그아웃: 이 세션의 access/refresh 쌍을 폐기 목록에 올린다 (영속, 재시작 생존).
+// ATProto 규약상 refresh 토큰으로 호출되지만, access 토큰이 와도 같은 jti를
+// 폐기하므로 결과는 동일하다. 만료된 토큰의 폐기 요청도 수용한다 (해가 없다).
+xrpc('post', 'com.atproto.server.deleteSession', req => {
+  const token = (req.headers.authorization || '').replace(/^Bearer /, '')
+  const payload = verifyJwt(token)
+  if (!payload || !['com.atproto.refresh', 'com.atproto.access'].includes(payload.scope))
+    httpError(401, 'InvalidToken', 'Valid session token required')
+  revokeSession(payload.jti || tokenId(token))
+  console.log(`👋 로그아웃: ${payload.sub}`)
+  return {}
 })
 
 xrpc('get', 'com.atproto.server.getSession', req => {
