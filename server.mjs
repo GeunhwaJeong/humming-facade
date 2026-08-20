@@ -14,7 +14,10 @@ import {
   DENY_RESERVED_TABLE, DENY_BLOCKED_TABLE,
 } from './lib/config.mjs'
 import { verifyJwt, sessionTokens, hashPassword, verifyPassword, DUMMY_HASH } from './lib/auth.mjs'
-import { checkNewPassword, isAllowedMediaMime, safeEqual } from './lib/policy.mjs'
+import {
+  checkNewPassword, isAllowedMediaMime, safeEqual,
+  MAX_POST_TEXT_CHARS, MAX_DISPLAY_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_APPLY_WRITES,
+} from './lib/policy.mjs'
 import { revokeSession, isRevoked, tokenId } from './lib/revocation.mjs'
 import { writeFileAtomic } from './lib/atomic.mjs'
 import { noteChange as noteBackupChange, startBackups } from './lib/backup.mjs'
@@ -618,6 +621,34 @@ app.use(
   }),
 )
 
+// ---- 지출·쓰기 엔드포인트 per-계정 레이트리밋 ----
+// 결제(구독/구매/팁)와 온체인 쓰기(글 작성)는 요청마다 실제 tx 비용이 나간다.
+// 키는 토큰의 계정(did): 로그인 표면과 달리 인증 뒤 표면이라 계정 단위가 정확하고,
+// 토큰이 없거나 깨진 요청은 IP로 묶는다 (어차피 핸들러의 인증에서 거부된다).
+const acctKey = req => {
+  const payload = verifyJwt((req.headers.authorization || '').replace(/^Bearer /, ''))
+  return payload?.sub ? `did:${payload.sub}` : req.ip
+}
+const moneyLimiter = rateLimit({
+  windowMs: 60_000,
+  max: limitOf('HUMMING_MONEY_ACCT_LIMIT', 10),
+  key: acctKey,
+  message: 'Too many payment requests, slow down and try again',
+})
+for (const nsid of [
+  'app.humming.monetization.subscribe',
+  'app.humming.monetization.purchasePost',
+  'app.humming.monetization.tip',
+]) app.use(`/xrpc/${nsid}`, moneyLimiter)
+const writeLimiter = rateLimit({
+  windowMs: 60_000,
+  max: limitOf('HUMMING_WRITE_ACCT_LIMIT', 30),
+  key: acctKey,
+  message: 'Too many writes, slow down and try again',
+})
+for (const nsid of ['com.atproto.repo.applyWrites', 'com.atproto.repo.createRecord'])
+  app.use(`/xrpc/${nsid}`, writeLimiter)
+
 const implemented = {}
 function xrpc(method, nsid, handler) {
   implemented[nsid] = true
@@ -1007,11 +1038,8 @@ xrpc('get', 'app.bsky.unspecced.getSuggestedOnboardingUsers', req => {
 xrpc('get', 'app.bsky.draft.getDrafts', () => ({ drafts: [] }))
 xrpc('get', 'chat.bsky.convo.getConvoAvailability', () => ({ canChat: false }))
 xrpc('get', 'app.bsky.unspecced.getSuggestedFeeds', () => ({ feeds: [] }))
-// "내 피드"에서 following 외 피드 요청 시에도 온체인 타임라인 반환
-xrpc('get', 'app.bsky.feed.getFeed', async req => {
-  const posts = await loadPostsFor(req)
-  return { feed: posts.map(p => ({ post: p.post })) }
-})
+// (getFeed 중복 등록 제거: express는 먼저 등록된 라우트가 응답하므로 위의
+// getFeed(discover) 하나가 "내 피드"의 커스텀 피드 요청까지 전부 처리한다)
 
 // --- writes: app → facade → SDK Transaction → chain ---
 // 직렬화는 lib/chain의 per-address 큐가 담당 — 지갑이 다르면 완전 병렬
@@ -1029,6 +1057,9 @@ function tidNow() {
 }
 
 async function submitPostOnChain(acct, text, parentId, media, paywallGeunhwa, langs) {
+  // 본문 길이 상한: 앱은 300 grapheme에서 자르지만 API 직접 호출은 무제한이었다
+  if (String(text ?? '').length > MAX_POST_TEXT_CHARS)
+    httpError(400, 'InvalidRequest', `Post text must be at most ${MAX_POST_TEXT_CHARS} characters`)
   // 페이월 가격은 서버가 재검증 (클라이언트 값 신뢰 금지): 0.01~100 HANEUL
   const paywall =
     Number.isFinite(Number(paywallGeunhwa)) &&
@@ -1171,8 +1202,12 @@ function mediaFromEmbed(embed) {
 
 xrpc('post', 'com.atproto.repo.applyWrites', async req => {
   const acct = requireAuthAcct(req)
+  const writes = req.body.writes || []
+  // 요청당 쓰기 수 상한: 한 요청이 온체인 tx를 무제한으로 만들 수 없게 한다
+  if (writes.length > MAX_APPLY_WRITES)
+    httpError(400, 'InvalidRequest', `applyWrites accepts at most ${MAX_APPLY_WRITES} writes per request`)
   const results = []
-  for (const w of req.body.writes || []) {
+  for (const w of writes) {
     const isCreate = (w.$type || '').endsWith('#create')
     if (isCreate && w.collection === 'app.bsky.feed.post') {
       const parentId = parentIdFromUri(w.value?.reply?.parent?.uri)
@@ -1233,6 +1268,11 @@ xrpc('post', 'com.atproto.repo.putRecord', async req => {
   const acct = requireAuthAcct(req)
   const { collection, rkey, record } = req.body
   if (collection === 'app.bsky.actor.profile') {
+    // 길이 상한은 앱의 프로필 편집 화면과 동일 (64/256), 초과는 API 직접 호출뿐
+    if (typeof record?.displayName === 'string' && record.displayName.length > MAX_DISPLAY_NAME_CHARS)
+      httpError(400, 'InvalidRequest', `displayName must be at most ${MAX_DISPLAY_NAME_CHARS} characters`)
+    if (typeof record?.description === 'string' && record.description.length > MAX_DESCRIPTION_CHARS)
+      httpError(400, 'InvalidRequest', `description must be at most ${MAX_DESCRIPTION_CHARS} characters`)
     if (record?.displayName) acct.displayName = record.displayName
     if (record?.description !== undefined) acct.description = record.description || ''
     if (acct.signup) persistAccounts()
