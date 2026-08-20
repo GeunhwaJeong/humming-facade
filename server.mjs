@@ -10,14 +10,24 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  NETWORK, RPC_URL, IS_LOCALNET, MAINNET_CHAIN_ID, PKG, NS_PKG, APP_WALLET, HANEUL_TYPE,
+  NETWORK, RPC_URL, IS_LOCALNET, MAINNET_CHAIN_ID, PKG, NS_PKG, NS_OBJ, APP_WALLET, HANEUL_TYPE,
   DENY_RESERVED_TABLE, DENY_BLOCKED_TABLE,
 } from './lib/config.mjs'
 import { verifyJwt, sessionTokens, hashPassword, verifyPassword, DUMMY_HASH } from './lib/auth.mjs'
+import {
+  checkNewPassword, isAllowedMediaMime, safeEqual,
+  MAX_POST_TEXT_CHARS, MAX_DISPLAY_NAME_CHARS, MAX_DESCRIPTION_CHARS, MAX_APPLY_WRITES,
+} from './lib/policy.mjs'
+import { revokeSession, isRevoked, tokenId } from './lib/revocation.mjs'
 import { writeFileAtomic } from './lib/atomic.mjs'
-import { noteChange as noteBackupChange, startBackups } from './lib/backup.mjs'
+import { noteChange as noteBackupChange, startBackups, flushBackups } from './lib/backup.mjs'
 import { idempotent, idempotencyKeyFor } from './lib/idempotency.mjs'
+import {
+  withPendingTx, reconcilePendingTxs, PENDING_HORIZON_MS,
+  loadPendingSignups, addPendingSignup, removePendingSignup,
+} from './lib/pending.mjs'
 import { rateLimit } from './lib/ratelimit.mjs'
+import { clampLimit, pagePosts } from './lib/paginate.mjs'
 import { loadKeys, importFromCliKeystore, createWallet, removeWallet, keypairFor } from './lib/keys.mjs'
 import { bcs } from '@haneullabs/haneul/bcs'
 import { grpcClient } from './lib/client.mjs'
@@ -28,7 +38,9 @@ import {
 } from './lib/chain.mjs'
 import {
   state as chainState, stateVersion, gateView, initIndex, startTailing, stats,
+  tailingHealth, stopTailing, flushCursor,
 } from './lib/indexer.mjs'
+import { newRequestId, auditMoney } from './lib/audit.mjs'
 
 const PORT = Number(process.env.PORT ?? 3025)
 // 미디어 서명 URL에 박히는 외부 노출 주소 — 배포 시 HUMMING_PUBLIC_URL 필수(부팅 가드가 강제)
@@ -322,8 +334,11 @@ async function isDeniedName(label) {
   }
   return false
 }
-// 'grace.hum.haneul' → 레지스트리 테이블에서 NameRecord 조회 (labels는 TLD-first)
-async function chainNameRecord(handle) {
+// 'grace.hum.haneul' → 레지스트리 테이블에서 NameRecord 조회 (labels는 TLD-first).
+// strict=false: 조회 실패를 부재(null)로 뭉갠다 (읽기 경로의 관용 동작).
+// strict=true: 실패를 그대로 던진다. 가입 화해처럼 "부재 확인"이 지갑 롤백의
+// 근거가 되는 곳은 실패와 부재를 구분해야 한다.
+async function chainNameRecord(handle, { strict = false } = {}) {
   const labels = String(handle || '').toLowerCase().split('.').reverse()
   if (labels.length < 2 || labels[0] !== 'haneul') return null
   try {
@@ -336,7 +351,8 @@ async function chainNameRecord(handle) {
     const target = deepFind(rec, 'target_address')
     if (target === undefined) return null
     return { target }
-  } catch {
+  } catch (e) {
+    if (strict) throw e
     return null
   }
 }
@@ -354,9 +370,14 @@ const httpError = (status, errorName, message) => {
 function didFromAuth(req) {
   const header = req.headers.authorization
   if (!header) return null
-  const payload = verifyJwt(header.replace(/^Bearer /, ''))
+  const token = header.replace(/^Bearer /, '')
+  const payload = verifyJwt(token)
   if (!payload || payload.scope !== 'com.atproto.access')
     httpError(401, 'InvalidToken', 'Invalid access token')
+  // deleteSession으로 폐기된 세션의 토큰은 서명이 유효해도 거부한다
+  // (jti 공유 폐기, 구형 무-jti 토큰은 해시로)
+  if (isRevoked(payload.jti) || (!payload.jti && isRevoked(tokenId(token))))
+    httpError(401, 'InvalidToken', 'Session has been revoked')
   if (payload.exp <= Math.floor(Date.now() / 1000))
     httpError(400, 'ExpiredToken', 'Access token has expired')
   return payload.sub
@@ -574,8 +595,17 @@ app.use('/xrpc', (req, res, next) => {
   res.setHeader('Retry-After', '2')
   res.status(503).json({ error: 'ServiceUnavailable', message: 'Warming up: chain index backfill in progress' })
 })
+// 테일링 랙 임계: 이보다 오래 스트림이 침묵하면 인덱스가 낡아지고 있다고 본다.
+// degraded여도 200은 유지한다 (LB가 노드를 뺐다 넣었다 하는 플래핑 방지),
+// 모니터링은 degraded 필드와 lagSeconds를 본다.
+const TAILING_DEGRADED_S = Number(process.env.HUMMING_TAILING_DEGRADED_S ?? 120)
 app.get('/health', (req, res) => {
-  res.status(chainReady ? 200 : 503).json({ ready: chainReady, ...(chainReady && { events: stats() }) })
+  const t = tailingHealth()
+  const degraded = chainReady && (t.lagSeconds == null || t.lagSeconds > TAILING_DEGRADED_S)
+  res.status(chainReady ? 200 : 503).json({
+    ready: chainReady,
+    ...(chainReady && { events: stats(), ...t, degraded }),
+  })
 })
 
 // ---- 인증 표면 레이트리밋 ----
@@ -611,6 +641,34 @@ app.use(
   }),
 )
 
+// ---- 지출·쓰기 엔드포인트 per-계정 레이트리밋 ----
+// 결제(구독/구매/팁)와 온체인 쓰기(글 작성)는 요청마다 실제 tx 비용이 나간다.
+// 키는 토큰의 계정(did): 로그인 표면과 달리 인증 뒤 표면이라 계정 단위가 정확하고,
+// 토큰이 없거나 깨진 요청은 IP로 묶는다 (어차피 핸들러의 인증에서 거부된다).
+const acctKey = req => {
+  const payload = verifyJwt((req.headers.authorization || '').replace(/^Bearer /, ''))
+  return payload?.sub ? `did:${payload.sub}` : req.ip
+}
+const moneyLimiter = rateLimit({
+  windowMs: 60_000,
+  max: limitOf('HUMMING_MONEY_ACCT_LIMIT', 10),
+  key: acctKey,
+  message: 'Too many payment requests, slow down and try again',
+})
+for (const nsid of [
+  'app.humming.monetization.subscribe',
+  'app.humming.monetization.purchasePost',
+  'app.humming.monetization.tip',
+]) app.use(`/xrpc/${nsid}`, moneyLimiter)
+const writeLimiter = rateLimit({
+  windowMs: 60_000,
+  max: limitOf('HUMMING_WRITE_ACCT_LIMIT', 30),
+  key: acctKey,
+  message: 'Too many writes, slow down and try again',
+})
+for (const nsid of ['com.atproto.repo.applyWrites', 'com.atproto.repo.createRecord'])
+  app.use(`/xrpc/${nsid}`, writeLimiter)
+
 const implemented = {}
 function xrpc(method, nsid, handler) {
   implemented[nsid] = true
@@ -644,6 +702,9 @@ xrpc('post', 'com.atproto.server.createAccount', async req => {
     throw e
   }
   if (!handle || !password) fail(400, 'InvalidRequest', 'handle and password are required')
+  // 정책은 신규 생성에만 강제한다. 로그인(createSession)에 걸면 기존 유저가 잠긴다.
+  const pwProblem = checkNewPassword(password)
+  if (pwProblem) fail(400, 'InvalidPassword', pwProblem)
   const h = String(handle).toLowerCase()
   if (!h.endsWith('.hum.haneul')) fail(400, 'UnsupportedDomain', 'handle must end with .hum.haneul')
   const name = h.slice(0, -'.hum.haneul'.length)
@@ -656,6 +717,10 @@ xrpc('post', 'com.atproto.server.createAccount', async req => {
 
   // ① 새 지갑 — 인프로세스 키 생성, 파사드 키 저장소에 등록 (비수탁 전환 전까지의 수탁 데모)
   const { address } = createWallet()
+  // 체인 등록 성공 후 ACCOUNTS 기록 전에 죽으면 "고아 지갑 + 영구 소진 핸들"이 남는다:
+  // 체인 호출 전에 pending으로 남겨 부팅 화해(reconcileSignups)가 계정을 입양하게 한다
+  const passwordHash = await hashPassword(password)
+  addPendingSignup({ handle: h, address, passwordHash, ts: Date.now() })
   try {
     if (IS_LOCALNET) {
       // ② 가스 지급(로컬넷 faucet) ③ 닉네임 발급 — hum.haneul 부모 NFT 소유자(앱 지갑)가
@@ -673,6 +738,7 @@ xrpc('post', 'com.atproto.server.createAccount', async req => {
   } catch (e) {
     // 온체인 등록 실패(동시 가입으로 leaf 선점 등) → 방금 만든 키 롤백, 고아 키 방지
     removeWallet(address)
+    removePendingSignup(h)
     throw e
   }
   const acct = {
@@ -681,11 +747,12 @@ xrpc('post', 'com.atproto.server.createAccount', async req => {
     address,
     displayName: name,
     description: 'New on Humming',
-    passwordHash: await hashPassword(password),
+    passwordHash,
     signup: true,
   }
   ACCOUNTS.push(acct)
   persistAccounts()
+  removePendingSignup(h)
   console.log(`🐣 가입: ${acct.handle} → 지갑 ${acct.address.slice(0, 10)}… (온체인 leaf 등록)`)
   return {
     ...sessionTokens(acct.did),
@@ -718,9 +785,12 @@ xrpc('post', 'com.atproto.server.createSession', async req => {
 
 // refresh 스코프 토큰만 수용 — access 토큰으로 세션을 연장할 수 없다
 xrpc('post', 'com.atproto.server.refreshSession', req => {
-  const payload = verifyJwt((req.headers.authorization || '').replace(/^Bearer /, ''))
+  const token = (req.headers.authorization || '').replace(/^Bearer /, '')
+  const payload = verifyJwt(token)
   if (!payload || payload.scope !== 'com.atproto.refresh')
     httpError(401, 'InvalidToken', 'Valid refresh token required')
+  if (isRevoked(payload.jti) || (!payload.jti && isRevoked(tokenId(token))))
+    httpError(401, 'InvalidToken', 'Session has been revoked')
   if (payload.exp <= Math.floor(Date.now() / 1000))
     httpError(400, 'ExpiredToken', 'Refresh token has expired')
   const acct = byDid(payload.sub)
@@ -731,6 +801,19 @@ xrpc('post', 'com.atproto.server.refreshSession', req => {
     did: acct.did,
     active: true,
   }
+})
+
+// 로그아웃: 이 세션의 access/refresh 쌍을 폐기 목록에 올린다 (영속, 재시작 생존).
+// ATProto 규약상 refresh 토큰으로 호출되지만, access 토큰이 와도 같은 jti를
+// 폐기하므로 결과는 동일하다. 만료된 토큰의 폐기 요청도 수용한다 (해가 없다).
+xrpc('post', 'com.atproto.server.deleteSession', req => {
+  const token = (req.headers.authorization || '').replace(/^Bearer /, '')
+  const payload = verifyJwt(token)
+  if (!payload || !['com.atproto.refresh', 'com.atproto.access'].includes(payload.scope))
+    httpError(401, 'InvalidToken', 'Valid session token required')
+  revokeSession(payload.jti || tokenId(token))
+  console.log(`👋 로그아웃: ${payload.sub}`)
+  return {}
 })
 
 xrpc('get', 'com.atproto.server.getSession', req => {
@@ -798,31 +881,42 @@ xrpc('get', 'app.bsky.actor.getPreferences', () => ({
 xrpc('post', 'app.bsky.actor.putPreferences', () => ({}))
 
 // --- app.bsky.feed ---
-xrpc('get', 'app.bsky.feed.getTimeline', async req => {
-  const posts = await loadPostsFor(req)
-  console.log(`📜 getTimeline → 온체인 게시물 ${posts.length}개 서빙`)
-  return { feed: posts.map(p => ({ post: p.post })) }
-})
-// 비로그인 랜딩(Discover)이 요청하는 feedgen 뷰 — 어떤 feed URI가 오든
+// 타임라인·피드 공용 페이지 응답: 전량이 아니라 요청 페이지만 게이팅해 서빙한다.
+// 게이팅(서명 미디어 URL 발급 포함)을 슬라이스 뒤에 하므로 비용이 페이지 크기에
+// 비례하고, 잠금 판정은 항목 단위라 페이지별 적용이 전체 적용과 동일하다.
+async function pagedTimeline(req, label) {
+  const [posts, gate] = await Promise.all([loadPosts(), loadGateState()])
+  const limit = clampLimit(req.query.limit)
+  const { items, cursor } = pagePosts(posts, limit, req.query.cursor)
+  const page = gatePosts(items, byDid(didFromAuth(req)), gate)
+  console.log(`📜 ${label} → 온체인 게시물 ${page.length}/${posts.length}개 서빙`)
+  return { feed: page.map(p => ({ post: p.post })), ...(cursor ? { cursor } : {}) }
+}
+xrpc('get', 'app.bsky.feed.getTimeline', req => pagedTimeline(req, 'getTimeline'))
+// 비로그인 랜딩(Discover)이 요청하는 feedgen 뷰: 어떤 feed URI가 오든
 // 같은 공개 타임라인을 돌려준다(익명 게이팅 동일 적용). 앱의 loggedOutFetch가
 // 여기로 오면서 실제 Bluesky 콘텐츠가 첫 화면에 노출되던 문제의 서버 측 짝.
-xrpc('get', 'app.bsky.feed.getFeed', async req => {
-  const posts = await loadPostsFor(req)
-  console.log(`📜 getFeed(discover) → 온체인 게시물 ${posts.length}개 서빙`)
-  return { feed: posts.map(p => ({ post: p.post })) }
-})
+// "내 피드"의 커스텀 피드 요청도 이 라우트 하나가 처리한다.
+xrpc('get', 'app.bsky.feed.getFeed', req => pagedTimeline(req, 'getFeed'))
 xrpc('get', 'app.bsky.feed.getAuthorFeed', async req => {
   const acct = byHandle(req.query.actor) || byDid(req.query.actor)
-  const posts = await loadPostsFor(req)
-  return {
-    feed: posts
-      .filter(p => acct && p.author.did === acct.did)
-      // 온체인 설정 previews=false인 크리에이터는 비구독자 프로필 피드에서 글을 통째로 숨김
-      // (담벼락 패널은 앱이 렌더) — previews=true면 잠금 카드로 노출
-      .filter(p => !(p.post.humming?.reason === 'profile' && !p.post.humming?.previews))
-      .map(p => ({ post: p.post })),
-  }
+  const [posts, gate] = await Promise.all([loadPosts(), loadGateState()])
+  // 작성자 필터·previews 숨김은 게이팅 결과에 의존하므로 슬라이스보다 먼저 적용한다
+  // (작성자 글만 게이팅하니 비용은 그 계정의 글 수에 비례)
+  const visible = gatePosts(
+    posts.filter(p => acct && p.author.did === acct.did),
+    byDid(didFromAuth(req)),
+    gate,
+  )
+    // 온체인 설정 previews=false인 크리에이터는 비구독자 프로필 피드에서 글을 통째로 숨김
+    // (담벼락 패널은 앱이 렌더). previews=true면 잠금 카드로 노출
+    .filter(p => !(p.post.humming?.reason === 'profile' && !p.post.humming?.previews))
+  const { items, cursor } = pagePosts(visible, clampLimit(req.query.limit), req.query.cursor)
+  return { feed: items.map(p => ({ post: p.post })), ...(cursor ? { cursor } : {}) }
 })
+// 스레드 답글 상한: 답글이 무제한이면 스레드 뷰가 타임라인 페이지네이션을 우회하는
+// 전량 덤프 표면이 된다 (최신 답글 우선이 아닌 오름차순 유지, 앞에서 자름)
+const THREAD_REPLY_LIMIT = 100
 xrpc('get', 'app.bsky.feed.getPostThread', async req => {
   const posts = await loadPostsFor(req)
   const found = findPostByUri(posts, req.query.uri)
@@ -837,6 +931,7 @@ xrpc('get', 'app.bsky.feed.getPostThread', async req => {
       post: found.post,
       replies: posts
         .filter(p => p.repliedTo != null && String(p.repliedTo) === found.postId)
+        .slice(0, THREAD_REPLY_LIMIT)
         .map(p => ({ $type: 'app.bsky.feed.defs#threadViewPost', post: p.post, replies: [] })),
     },
   }
@@ -957,10 +1052,11 @@ xrpc('get', 'app.bsky.unspecced.getPostThreadV2', async req => {
     cur = parent
   }
   thread.push(item(anchor, 0))
-  for (const r of posts.filter(p => p.repliedTo != null && String(p.repliedTo) === anchor.postId)) {
+  const replies = posts.filter(p => p.repliedTo != null && String(p.repliedTo) === anchor.postId)
+  for (const r of replies.slice(0, THREAD_REPLY_LIMIT)) {
     thread.push(item(r, 1))
   }
-  return { thread, hasOtherReplies: false }
+  return { thread, hasOtherReplies: replies.length > THREAD_REPLY_LIMIT }
 })
 xrpc('get', 'app.bsky.unspecced.getPostThreadOtherV2', () => ({ thread: [] }))
 // 탐색/프로필 부가 화면 스텁
@@ -981,11 +1077,8 @@ xrpc('get', 'app.bsky.unspecced.getSuggestedOnboardingUsers', req => {
 xrpc('get', 'app.bsky.draft.getDrafts', () => ({ drafts: [] }))
 xrpc('get', 'chat.bsky.convo.getConvoAvailability', () => ({ canChat: false }))
 xrpc('get', 'app.bsky.unspecced.getSuggestedFeeds', () => ({ feeds: [] }))
-// "내 피드"에서 following 외 피드 요청 시에도 온체인 타임라인 반환
-xrpc('get', 'app.bsky.feed.getFeed', async req => {
-  const posts = await loadPostsFor(req)
-  return { feed: posts.map(p => ({ post: p.post })) }
-})
+// (getFeed 중복 등록 제거: express는 먼저 등록된 라우트가 응답하므로 위의
+// getFeed(discover) 하나가 "내 피드"의 커스텀 피드 요청까지 전부 처리한다)
 
 // --- writes: app → facade → SDK Transaction → chain ---
 // 직렬화는 lib/chain의 per-address 큐가 담당 — 지갑이 다르면 완전 병렬
@@ -1003,6 +1096,9 @@ function tidNow() {
 }
 
 async function submitPostOnChain(acct, text, parentId, media, paywallGeunhwa, langs) {
+  // 본문 길이 상한: 앱은 300 grapheme에서 자르지만 API 직접 호출은 무제한이었다
+  if (String(text ?? '').length > MAX_POST_TEXT_CHARS)
+    httpError(400, 'InvalidRequest', `Post text must be at most ${MAX_POST_TEXT_CHARS} characters`)
   // 페이월 가격은 서버가 재검증 (클라이언트 값 신뢰 금지): 0.01~100 HANEUL
   const paywall =
     Number.isFinite(Number(paywallGeunhwa)) &&
@@ -1039,6 +1135,23 @@ function requireAuthAcct(req) {
   return acct
 }
 
+// ---- 업로드 용량 쿼터 ----
+// 계정당 저장 바이트 상한. 최초 요청 때 meta.json을 훑어 집계를 만들고 이후 증분 유지.
+const MEDIA_QUOTA_BYTES = Number(process.env.HUMMING_MEDIA_QUOTA_BYTES ?? 512 * 1024 * 1024)
+let mediaUsage = null // address → 저장 바이트 합
+function mediaUsageMap() {
+  if (mediaUsage) return mediaUsage
+  mediaUsage = new Map()
+  for (const f of fs.readdirSync(MEDIA_DIR)) {
+    if (!f.endsWith('.meta.json')) continue
+    try {
+      const m = JSON.parse(fs.readFileSync(path.join(MEDIA_DIR, f), 'utf8'))
+      if (m.owner) mediaUsage.set(m.owner, (mediaUsage.get(m.owner) || 0) + (Number(m.size) || 0))
+    } catch {}
+  }
+  return mediaUsage
+}
+
 // 미디어 업로드: 파일은 디스크에(오프체인), 반환된 CID가 게시물의 온체인 포인터가 됨
 app.post(
   '/xrpc/com.atproto.repo.uploadBlob',
@@ -1049,19 +1162,35 @@ app.post(
       if (!acct) return res.status(401).json({ error: 'AuthRequired' })
       const bytes = req.body
       const mime = req.headers['content-type'] || 'application/octet-stream'
+      // 저장·반사되는 Content-Type은 화이트리스트만: 임의 타입을 받으면 우리 origin에서
+      // text/html 등을 서빙하는 서명 URL이 만들어진다 (svg 포함 스크립트 계열 차단)
+      if (!isAllowedMediaMime(mime))
+        return res.status(400).json({
+          error: 'InvalidMimeType',
+          message: 'Only image/* and video/* uploads are supported',
+        })
       // 실제 PDS와 동일하게 blob CID = raw(0x55) + sha256 — 파일 내용이 곧 주소
       const digest = await sha256.digest(bytes)
       const cid = CID.createV1(0x55, digest).toString()
       // CID는 내용 주소 — 반쯤 쓰인 블롭이 그 주소로 서빙되는 일이 없게 원자적으로 쓴다.
       // owner는 최초 업로더로 고정: 같은 파일을 나중에 올린 사람이 소유권을 뺏지 못한다
       let owner = acct.address
+      let isNewBlob = true
       try {
         const prev = JSON.parse(fs.readFileSync(path.join(MEDIA_DIR, `${cid}.meta.json`), 'utf8'))
         if (prev.owner) owner = prev.owner
+        isNewBlob = false // 동일 내용 재업로드: 저장량이 늘지 않으므로 쿼터에 다시 안 센다
       } catch {}
+      const usage = mediaUsageMap()
+      if (isNewBlob && (usage.get(owner) || 0) + bytes.length > MEDIA_QUOTA_BYTES)
+        return res.status(400).json({
+          error: 'QuotaExceeded',
+          message: 'Media storage quota exceeded for this account',
+        })
       mediaMetaOwners.set(cid, owner)
       writeFileAtomic(path.join(MEDIA_DIR, cid), bytes, { mode: 0o644 })
       writeFileAtomic(path.join(MEDIA_DIR, `${cid}.meta.json`), JSON.stringify({ mime, size: bytes.length, owner }), { mode: 0o644 })
+      if (isNewBlob) usage.set(owner, (usage.get(owner) || 0) + bytes.length)
       console.log(`📦 업로드: ${cid.slice(0, 16)}… (${mime}, ${bytes.length}B) by ${acct.handle}`)
       res.json({ blob: { $type: 'blob', ref: { $link: cid }, mimeType: mime, size: bytes.length } })
     } catch (e) {
@@ -1079,14 +1208,19 @@ app.get('/media/:cid', (req, res) => {
   const { cid } = req.params
   const { exp, sig } = req.query
   if (!/^[a-z2-7]+$/.test(cid)) return res.status(400).end()
-  if (!exp || Number(exp) < Date.now() || sig !== signMedia(cid, exp)) {
+  // 서명 비교는 상수시간으로 (!== 는 앞자리부터 맞춰가는 타이밍 오라클)
+  if (!exp || Number(exp) < Date.now() || !safeEqual(sig, signMedia(cid, exp))) {
     return res.status(403).json({ error: 'Forbidden', message: 'Missing or expired media URL signature' })
   }
   const file = path.join(MEDIA_DIR, cid)
   if (!fs.existsSync(file)) return res.status(404).end()
+  // 화이트리스트 이전에 저장된 임의 타입이 남아 있어도 브라우저가 스니핑으로
+  // 실행형 타입으로 승격하지 못하게 한다
+  res.setHeader('X-Content-Type-Options', 'nosniff')
   try {
     const meta = JSON.parse(fs.readFileSync(`${file}.meta.json`, 'utf8'))
-    res.setHeader('Content-Type', meta.mime)
+    if (isAllowedMediaMime(meta.mime)) res.setHeader('Content-Type', meta.mime)
+    else res.setHeader('Content-Type', 'application/octet-stream')
   } catch {}
   res.setHeader('Cache-Control', 'private, max-age=900')
   fs.createReadStream(file).pipe(res)
@@ -1107,8 +1241,12 @@ function mediaFromEmbed(embed) {
 
 xrpc('post', 'com.atproto.repo.applyWrites', async req => {
   const acct = requireAuthAcct(req)
+  const writes = req.body.writes || []
+  // 요청당 쓰기 수 상한: 한 요청이 온체인 tx를 무제한으로 만들 수 없게 한다
+  if (writes.length > MAX_APPLY_WRITES)
+    httpError(400, 'InvalidRequest', `applyWrites accepts at most ${MAX_APPLY_WRITES} writes per request`)
   const results = []
-  for (const w of req.body.writes || []) {
+  for (const w of writes) {
     const isCreate = (w.$type || '').endsWith('#create')
     if (isCreate && w.collection === 'app.bsky.feed.post') {
       const parentId = parentIdFromUri(w.value?.reply?.parent?.uri)
@@ -1169,6 +1307,11 @@ xrpc('post', 'com.atproto.repo.putRecord', async req => {
   const acct = requireAuthAcct(req)
   const { collection, rkey, record } = req.body
   if (collection === 'app.bsky.actor.profile') {
+    // 길이 상한은 앱의 프로필 편집 화면과 동일 (64/256), 초과는 API 직접 호출뿐
+    if (typeof record?.displayName === 'string' && record.displayName.length > MAX_DISPLAY_NAME_CHARS)
+      httpError(400, 'InvalidRequest', `displayName must be at most ${MAX_DISPLAY_NAME_CHARS} characters`)
+    if (typeof record?.description === 'string' && record.description.length > MAX_DESCRIPTION_CHARS)
+      httpError(400, 'InvalidRequest', `description must be at most ${MAX_DESCRIPTION_CHARS} characters`)
     if (record?.displayName) acct.displayName = record.displayName
     if (record?.description !== undefined) acct.description = record.description || ''
     if (acct.signup) persistAccounts()
@@ -1223,6 +1366,21 @@ xrpc('get', 'app.humming.monetization.getCreator', async req => {
   }
 })
 
+// 결제 연산 감사 래퍼: 연산 1건당 요청 ID를 발급하고 성공(digest 포함)·실패를
+// 감사 로그(lib/audit)에 한 줄씩 남긴다. 실패도 남아야 중복 결제 분쟁을 재구성한다.
+async function auditedMoney(op, viewer, fields, fn) {
+  const reqId = newRequestId()
+  const base = { reqId, op, did: viewer.did, address: viewer.address, ...fields }
+  try {
+    const result = await fn()
+    auditMoney({ ...base, digest: result.digest, ...(result.prior && { prior: true }), outcome: 'success' })
+    return result
+  } catch (e) {
+    auditMoney({ ...base, outcome: 'error', error: e.message })
+    throw e
+  }
+}
+
 // 구독 결제: 뷰어 지갑이 서명 → subscriptions::subscribe (95/5 온체인 분배)
 xrpc('post', 'app.humming.monetization.subscribe', async req => {
   const viewer = requireAuthAcct(req)
@@ -1257,8 +1415,16 @@ xrpc('post', 'app.humming.monetization.subscribe', async req => {
     key: `sub|${viewer.address}|${tierId}`,
     windowMs: 60_000,
   })
-  const { digest } = await idempotent(idem.key, idem.windowMs, () =>
-    execTx(viewer.address, buildSubscribe(tierId, price, viewer.address), 'Subscribed'),
+  const { digest } = await auditedMoney(
+    'subscribe',
+    viewer,
+    { creator: creator.address, amountGeunhwa: price },
+    () =>
+      idempotent(idem.keys, idem.windowMs, () =>
+        withPendingTx(idem.contextKey, 'subscribe', { tier: tierId, price }, onDigest =>
+          execTx(viewer.address, buildSubscribe(tierId, price, viewer.address), 'Subscribed', { onDigest }),
+        ),
+      ),
   )
   console.log(`💳 구독: ${viewer.handle} → ${creator.handle} (${price / 1e9} HANEUL) tx=${digest}`)
   return { digest, priceGeunhwa: price }
@@ -1289,8 +1455,16 @@ xrpc('post', 'app.humming.monetization.purchasePost', async req => {
     key: `ppv|${viewer.address}|${postId}`,
     windowMs: 60_000,
   })
-  const { digest } = await idempotent(idem.key, idem.windowMs, () =>
-    execTx(viewer.address, buildPurchase(pw.paywall, price, viewer.address), 'PostPurchased'),
+  const { digest } = await auditedMoney(
+    'purchasePost',
+    viewer,
+    { postId, amountGeunhwa: price },
+    () =>
+      idempotent(idem.keys, idem.windowMs, () =>
+        withPendingTx(idem.contextKey, 'purchase', { paywall: pw.paywall, price }, onDigest =>
+          execTx(viewer.address, buildPurchase(pw.paywall, price, viewer.address), 'PostPurchased', { onDigest }),
+        ),
+      ),
   )
   console.log(`🎟️ 단건 구매: ${viewer.handle} → post ${postId} (${price / 1e9} HANEUL) tx=${digest}`)
   return { digest, priceGeunhwa: price, postId }
@@ -1321,8 +1495,16 @@ xrpc('post', 'app.humming.monetization.tip', async req => {
     key: `tip|${viewer.address}|${creator.address}|${postId ?? ''}|${amount}`,
     windowMs: 20_000,
   })
-  const { digest } = await idempotent(idem.key, idem.windowMs, () =>
-    execTx(viewer.address, buildTip(creator.address, postId, amount, viewer.address), 'TipSent'),
+  const { digest } = await auditedMoney(
+    'tip',
+    viewer,
+    { creator: creator.address, postId, amountGeunhwa: amount },
+    () =>
+      idempotent(idem.keys, idem.windowMs, () =>
+        withPendingTx(idem.contextKey, 'tip', { to: creator.address, postId, amount }, onDigest =>
+          execTx(viewer.address, buildTip(creator.address, postId, amount, viewer.address), 'TipSent', { onDigest }),
+        ),
+      ),
   )
   console.log(`💰 팁: ${viewer.handle} → ${creator.handle}${postId ? ` (post ${postId})` : ''} (${amount / 1e9} HANEUL) tx=${digest}`)
   return { digest, amountGeunhwa: amount }
@@ -1471,22 +1653,98 @@ if (!IS_LOCALNET && !keypairFor(APP_WALLET)) {
   process.exit(1)
 }
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`🚀 Humming XRPC 파사드: http://localhost:${PORT} (public: ${PUBLIC_URL})`)
   console.log(`   체인: ${RPC_URL} / 패키지: ${PKG.slice(0, 10)}…`)
   if (!chainReady) console.log('   ⏳ 인덱스 복원 완료 전까지 XRPC는 503 (fail-closed)')
 })
+
+// ---- 우아한 종료: 새 연결 차단 → 인플라이트 드레인 → 상태 플러시 → 종료 ----
+// 배포 재시작(systemd SIGTERM)이 진행 중 결제 요청을 자르지 않게 한다.
+// 결제 pending·감사 로그는 동기 append라 별도 플러시가 필요 없다.
+let shuttingDown = false
+async function shutdown(signal) {
+  if (shuttingDown) return
+  shuttingDown = true
+  console.log(`   ${signal} 수신: 새 연결을 닫고 진행 중 요청을 드레인합니다`)
+  stopTailing()
+  await Promise.race([
+    new Promise(resolve => server.close(resolve)),
+    // 드레인 상한: 이 이상 붙잡는 연결은 포기한다 (keep-alive 소켓 등)
+    new Promise(resolve => {
+      const t = setTimeout(resolve, 10_000)
+      t.unref?.()
+    }),
+  ])
+  flushCursor()
+  flushBackups()
+  console.log('   상태 플러시 완료, 종료합니다')
+  process.exit(0)
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'))
+process.on('SIGINT', () => shutdown('SIGINT'))
 // 복원이 전부 끝나야 서빙 개방(chainReady) — 부분 인덱스로 잠금을 판정하지 않는다.
 // 실패 시 성공할 때까지 재시도: 체인이 내려간 동안 503은 의도된 동작(누출보다 다운타임).
 // initIndex는 재호출 안전(리플레이·재구성 모두 멱등).
+// 가입 크래시 창 화해: pending 가입 레코드를 체인과 대조한다.
+// leaf가 우리 지갑으로 등록돼 있으면 계정을 입양하고(핸들·지갑 복구),
+// 부재가 확인되면 지갑 키를 롤백한다. 조회 실패는 다음 부팅에 재시도.
+async function reconcileSignups() {
+  for (const rec of loadPendingSignups()) {
+    if (byHandle(rec.handle)) {
+      removePendingSignup(rec.handle)
+      continue
+    }
+    let onchain
+    try {
+      onchain = await chainNameRecord(rec.handle, { strict: true })
+    } catch (e) {
+      console.warn(`   ⚠️ 가입 pending ${rec.handle} 체인 확인 실패 (다음 부팅에 재시도): ${e.message}`)
+      continue
+    }
+    if (onchain && onchain.target === rec.address) {
+      ACCOUNTS.push({
+        handle: rec.handle,
+        did: `did:web:${rec.handle}`,
+        address: rec.address,
+        displayName: rec.handle.slice(0, -'.hum.haneul'.length),
+        description: 'New on Humming',
+        passwordHash: rec.passwordHash,
+        signup: true,
+      })
+      persistAccounts()
+      console.log(`🐣 가입 복구: ${rec.handle} → 지갑 ${rec.address.slice(0, 10)}… (크래시로 누락된 계정 입양)`)
+    } else if (Date.now() - rec.ts <= PENDING_HORIZON_MS) {
+      // 크래시 직후의 빠른 재부팅: 등록 tx가 아직 체인에 실리는 중일 수 있다.
+      // 지금 "부재"로 확정해 키를 지우면, 직후 tx가 실렸을 때 키 없는 계정과
+      // 소진된 핸들이 남는다. 지평선이 지날 때까지 pending으로 유지한다.
+      continue
+    } else {
+      // 부재 확인(또는 남의 주소로 등록): 체인 등록 전에 죽은 가입, 키 롤백
+      removeWallet(rec.address)
+    }
+    removePendingSignup(rec.handle)
+  }
+}
+
 for (;;) {
   try {
-    await initIndex(ACCOUNTS.map(a => a.address))
+    // 함수로 넘긴다: 프루닝 복구(pruneRecover)가 부팅 이후 가입자 주소까지 반영
+    await initIndex(() => ACCOUNTS.map(a => a.address))
     break
   } catch (e) {
     console.error('   ⚠️ 인덱스 복원 실패, 5초 후 재시도:', e.message)
     await new Promise(r => setTimeout(r, 5000))
   }
+}
+// 결제 pending·가입 pending의 부팅 화해. 실패해도 서빙은 연다 (레코드는 남아
+// 재시도·다음 부팅이 처리하고, 미해결 결제 레코드는 요청 경로에서도 재판정된다)
+try {
+  const { kept } = await reconcilePendingTxs()
+  if (kept) console.log(`   ⏳ 미해결 결제 pending ${kept}건 유지 (재시도 시 체인 대조)`)
+  await reconcileSignups()
+} catch (e) {
+  console.warn(`   ⚠️ pending 화해 실패: ${e.message}`)
 }
 chainReady = true
 console.log(`   ⛓️  인덱스 복원 완료, 서빙 개방: ${stats()}`)
