@@ -27,6 +27,7 @@ import {
   loadPendingSignups, addPendingSignup, removePendingSignup,
 } from './lib/pending.mjs'
 import { rateLimit } from './lib/ratelimit.mjs'
+import { clampLimit, pagePosts } from './lib/paginate.mjs'
 import { loadKeys, importFromCliKeystore, createWallet, removeWallet, keypairFor } from './lib/keys.mjs'
 import { bcs } from '@haneullabs/haneul/bcs'
 import { grpcClient } from './lib/client.mjs'
@@ -869,31 +870,42 @@ xrpc('get', 'app.bsky.actor.getPreferences', () => ({
 xrpc('post', 'app.bsky.actor.putPreferences', () => ({}))
 
 // --- app.bsky.feed ---
-xrpc('get', 'app.bsky.feed.getTimeline', async req => {
-  const posts = await loadPostsFor(req)
-  console.log(`📜 getTimeline → 온체인 게시물 ${posts.length}개 서빙`)
-  return { feed: posts.map(p => ({ post: p.post })) }
-})
-// 비로그인 랜딩(Discover)이 요청하는 feedgen 뷰 — 어떤 feed URI가 오든
+// 타임라인·피드 공용 페이지 응답: 전량이 아니라 요청 페이지만 게이팅해 서빙한다.
+// 게이팅(서명 미디어 URL 발급 포함)을 슬라이스 뒤에 하므로 비용이 페이지 크기에
+// 비례하고, 잠금 판정은 항목 단위라 페이지별 적용이 전체 적용과 동일하다.
+async function pagedTimeline(req, label) {
+  const [posts, gate] = await Promise.all([loadPosts(), loadGateState()])
+  const limit = clampLimit(req.query.limit)
+  const { items, cursor } = pagePosts(posts, limit, req.query.cursor)
+  const page = gatePosts(items, byDid(didFromAuth(req)), gate)
+  console.log(`📜 ${label} → 온체인 게시물 ${page.length}/${posts.length}개 서빙`)
+  return { feed: page.map(p => ({ post: p.post })), ...(cursor ? { cursor } : {}) }
+}
+xrpc('get', 'app.bsky.feed.getTimeline', req => pagedTimeline(req, 'getTimeline'))
+// 비로그인 랜딩(Discover)이 요청하는 feedgen 뷰: 어떤 feed URI가 오든
 // 같은 공개 타임라인을 돌려준다(익명 게이팅 동일 적용). 앱의 loggedOutFetch가
 // 여기로 오면서 실제 Bluesky 콘텐츠가 첫 화면에 노출되던 문제의 서버 측 짝.
-xrpc('get', 'app.bsky.feed.getFeed', async req => {
-  const posts = await loadPostsFor(req)
-  console.log(`📜 getFeed(discover) → 온체인 게시물 ${posts.length}개 서빙`)
-  return { feed: posts.map(p => ({ post: p.post })) }
-})
+// "내 피드"의 커스텀 피드 요청도 이 라우트 하나가 처리한다.
+xrpc('get', 'app.bsky.feed.getFeed', req => pagedTimeline(req, 'getFeed'))
 xrpc('get', 'app.bsky.feed.getAuthorFeed', async req => {
   const acct = byHandle(req.query.actor) || byDid(req.query.actor)
-  const posts = await loadPostsFor(req)
-  return {
-    feed: posts
-      .filter(p => acct && p.author.did === acct.did)
-      // 온체인 설정 previews=false인 크리에이터는 비구독자 프로필 피드에서 글을 통째로 숨김
-      // (담벼락 패널은 앱이 렌더) — previews=true면 잠금 카드로 노출
-      .filter(p => !(p.post.humming?.reason === 'profile' && !p.post.humming?.previews))
-      .map(p => ({ post: p.post })),
-  }
+  const [posts, gate] = await Promise.all([loadPosts(), loadGateState()])
+  // 작성자 필터·previews 숨김은 게이팅 결과에 의존하므로 슬라이스보다 먼저 적용한다
+  // (작성자 글만 게이팅하니 비용은 그 계정의 글 수에 비례)
+  const visible = gatePosts(
+    posts.filter(p => acct && p.author.did === acct.did),
+    byDid(didFromAuth(req)),
+    gate,
+  )
+    // 온체인 설정 previews=false인 크리에이터는 비구독자 프로필 피드에서 글을 통째로 숨김
+    // (담벼락 패널은 앱이 렌더). previews=true면 잠금 카드로 노출
+    .filter(p => !(p.post.humming?.reason === 'profile' && !p.post.humming?.previews))
+  const { items, cursor } = pagePosts(visible, clampLimit(req.query.limit), req.query.cursor)
+  return { feed: items.map(p => ({ post: p.post })), ...(cursor ? { cursor } : {}) }
 })
+// 스레드 답글 상한: 답글이 무제한이면 스레드 뷰가 타임라인 페이지네이션을 우회하는
+// 전량 덤프 표면이 된다 (최신 답글 우선이 아닌 오름차순 유지, 앞에서 자름)
+const THREAD_REPLY_LIMIT = 100
 xrpc('get', 'app.bsky.feed.getPostThread', async req => {
   const posts = await loadPostsFor(req)
   const found = findPostByUri(posts, req.query.uri)
@@ -908,6 +920,7 @@ xrpc('get', 'app.bsky.feed.getPostThread', async req => {
       post: found.post,
       replies: posts
         .filter(p => p.repliedTo != null && String(p.repliedTo) === found.postId)
+        .slice(0, THREAD_REPLY_LIMIT)
         .map(p => ({ $type: 'app.bsky.feed.defs#threadViewPost', post: p.post, replies: [] })),
     },
   }
@@ -1028,10 +1041,11 @@ xrpc('get', 'app.bsky.unspecced.getPostThreadV2', async req => {
     cur = parent
   }
   thread.push(item(anchor, 0))
-  for (const r of posts.filter(p => p.repliedTo != null && String(p.repliedTo) === anchor.postId)) {
+  const replies = posts.filter(p => p.repliedTo != null && String(p.repliedTo) === anchor.postId)
+  for (const r of replies.slice(0, THREAD_REPLY_LIMIT)) {
     thread.push(item(r, 1))
   }
-  return { thread, hasOtherReplies: false }
+  return { thread, hasOtherReplies: replies.length > THREAD_REPLY_LIMIT }
 })
 xrpc('get', 'app.bsky.unspecced.getPostThreadOtherV2', () => ({ thread: [] }))
 // 탐색/프로필 부가 화면 스텁
@@ -1641,7 +1655,8 @@ async function reconcileSignups() {
 
 for (;;) {
   try {
-    await initIndex(ACCOUNTS.map(a => a.address))
+    // 함수로 넘긴다: 프루닝 복구(pruneRecover)가 부팅 이후 가입자 주소까지 반영
+    await initIndex(() => ACCOUNTS.map(a => a.address))
     break
   } catch (e) {
     console.error('   ⚠️ 인덱스 복원 실패, 5초 후 재시도:', e.message)
