@@ -23,7 +23,7 @@ import { writeFileAtomic } from './lib/atomic.mjs'
 import { noteChange as noteBackupChange, startBackups, flushBackups } from './lib/backup.mjs'
 import { idempotent, idempotencyKeyFor } from './lib/idempotency.mjs'
 import {
-  withPendingTx, reconcilePendingTxs,
+  withPendingTx, reconcilePendingTxs, PENDING_HORIZON_MS,
   loadPendingSignups, addPendingSignup, removePendingSignup,
 } from './lib/pending.mjs'
 import { rateLimit } from './lib/ratelimit.mjs'
@@ -1714,6 +1714,11 @@ async function reconcileSignups() {
       })
       persistAccounts()
       console.log(`🐣 가입 복구: ${rec.handle} → 지갑 ${rec.address.slice(0, 10)}… (크래시로 누락된 계정 입양)`)
+    } else if (Date.now() - rec.ts <= PENDING_HORIZON_MS) {
+      // 크래시 직후의 빠른 재부팅: 등록 tx가 아직 체인에 실리는 중일 수 있다.
+      // 지금 "부재"로 확정해 키를 지우면, 직후 tx가 실렸을 때 키 없는 계정과
+      // 소진된 핸들이 남는다. 지평선이 지날 때까지 pending으로 유지한다.
+      continue
     } else {
       // 부재 확인(또는 남의 주소로 등록): 체인 등록 전에 죽은 가입, 키 롤백
       removeWallet(rec.address)
