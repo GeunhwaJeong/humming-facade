@@ -14,7 +14,7 @@ import {
   DENY_RESERVED_TABLE, DENY_BLOCKED_TABLE,
 } from './lib/config.mjs'
 import { verifyJwt, sessionTokens, hashPassword, verifyPassword, DUMMY_HASH } from './lib/auth.mjs'
-import { checkNewPassword } from './lib/policy.mjs'
+import { checkNewPassword, isAllowedMediaMime, safeEqual } from './lib/policy.mjs'
 import { revokeSession, isRevoked, tokenId } from './lib/revocation.mjs'
 import { writeFileAtomic } from './lib/atomic.mjs'
 import { noteChange as noteBackupChange, startBackups } from './lib/backup.mjs'
@@ -1065,6 +1065,23 @@ function requireAuthAcct(req) {
   return acct
 }
 
+// ---- 업로드 용량 쿼터 ----
+// 계정당 저장 바이트 상한. 최초 요청 때 meta.json을 훑어 집계를 만들고 이후 증분 유지.
+const MEDIA_QUOTA_BYTES = Number(process.env.HUMMING_MEDIA_QUOTA_BYTES ?? 512 * 1024 * 1024)
+let mediaUsage = null // address → 저장 바이트 합
+function mediaUsageMap() {
+  if (mediaUsage) return mediaUsage
+  mediaUsage = new Map()
+  for (const f of fs.readdirSync(MEDIA_DIR)) {
+    if (!f.endsWith('.meta.json')) continue
+    try {
+      const m = JSON.parse(fs.readFileSync(path.join(MEDIA_DIR, f), 'utf8'))
+      if (m.owner) mediaUsage.set(m.owner, (mediaUsage.get(m.owner) || 0) + (Number(m.size) || 0))
+    } catch {}
+  }
+  return mediaUsage
+}
+
 // 미디어 업로드: 파일은 디스크에(오프체인), 반환된 CID가 게시물의 온체인 포인터가 됨
 app.post(
   '/xrpc/com.atproto.repo.uploadBlob',
@@ -1075,19 +1092,35 @@ app.post(
       if (!acct) return res.status(401).json({ error: 'AuthRequired' })
       const bytes = req.body
       const mime = req.headers['content-type'] || 'application/octet-stream'
+      // 저장·반사되는 Content-Type은 화이트리스트만: 임의 타입을 받으면 우리 origin에서
+      // text/html 등을 서빙하는 서명 URL이 만들어진다 (svg 포함 스크립트 계열 차단)
+      if (!isAllowedMediaMime(mime))
+        return res.status(400).json({
+          error: 'InvalidMimeType',
+          message: 'Only image/* and video/* uploads are supported',
+        })
       // 실제 PDS와 동일하게 blob CID = raw(0x55) + sha256 — 파일 내용이 곧 주소
       const digest = await sha256.digest(bytes)
       const cid = CID.createV1(0x55, digest).toString()
       // CID는 내용 주소 — 반쯤 쓰인 블롭이 그 주소로 서빙되는 일이 없게 원자적으로 쓴다.
       // owner는 최초 업로더로 고정: 같은 파일을 나중에 올린 사람이 소유권을 뺏지 못한다
       let owner = acct.address
+      let isNewBlob = true
       try {
         const prev = JSON.parse(fs.readFileSync(path.join(MEDIA_DIR, `${cid}.meta.json`), 'utf8'))
         if (prev.owner) owner = prev.owner
+        isNewBlob = false // 동일 내용 재업로드: 저장량이 늘지 않으므로 쿼터에 다시 안 센다
       } catch {}
+      const usage = mediaUsageMap()
+      if (isNewBlob && (usage.get(owner) || 0) + bytes.length > MEDIA_QUOTA_BYTES)
+        return res.status(400).json({
+          error: 'QuotaExceeded',
+          message: 'Media storage quota exceeded for this account',
+        })
       mediaMetaOwners.set(cid, owner)
       writeFileAtomic(path.join(MEDIA_DIR, cid), bytes, { mode: 0o644 })
       writeFileAtomic(path.join(MEDIA_DIR, `${cid}.meta.json`), JSON.stringify({ mime, size: bytes.length, owner }), { mode: 0o644 })
+      if (isNewBlob) usage.set(owner, (usage.get(owner) || 0) + bytes.length)
       console.log(`📦 업로드: ${cid.slice(0, 16)}… (${mime}, ${bytes.length}B) by ${acct.handle}`)
       res.json({ blob: { $type: 'blob', ref: { $link: cid }, mimeType: mime, size: bytes.length } })
     } catch (e) {
@@ -1105,14 +1138,19 @@ app.get('/media/:cid', (req, res) => {
   const { cid } = req.params
   const { exp, sig } = req.query
   if (!/^[a-z2-7]+$/.test(cid)) return res.status(400).end()
-  if (!exp || Number(exp) < Date.now() || sig !== signMedia(cid, exp)) {
+  // 서명 비교는 상수시간으로 (!== 는 앞자리부터 맞춰가는 타이밍 오라클)
+  if (!exp || Number(exp) < Date.now() || !safeEqual(sig, signMedia(cid, exp))) {
     return res.status(403).json({ error: 'Forbidden', message: 'Missing or expired media URL signature' })
   }
   const file = path.join(MEDIA_DIR, cid)
   if (!fs.existsSync(file)) return res.status(404).end()
+  // 화이트리스트 이전에 저장된 임의 타입이 남아 있어도 브라우저가 스니핑으로
+  // 실행형 타입으로 승격하지 못하게 한다
+  res.setHeader('X-Content-Type-Options', 'nosniff')
   try {
     const meta = JSON.parse(fs.readFileSync(`${file}.meta.json`, 'utf8'))
-    res.setHeader('Content-Type', meta.mime)
+    if (isAllowedMediaMime(meta.mime)) res.setHeader('Content-Type', meta.mime)
+    else res.setHeader('Content-Type', 'application/octet-stream')
   } catch {}
   res.setHeader('Cache-Control', 'private, max-age=900')
   fs.createReadStream(file).pipe(res)
