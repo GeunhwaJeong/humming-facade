@@ -22,6 +22,10 @@ import { revokeSession, isRevoked, tokenId } from './lib/revocation.mjs'
 import { writeFileAtomic } from './lib/atomic.mjs'
 import { noteChange as noteBackupChange, startBackups } from './lib/backup.mjs'
 import { idempotent, idempotencyKeyFor } from './lib/idempotency.mjs'
+import {
+  withPendingTx, reconcilePendingTxs,
+  loadPendingSignups, addPendingSignup, removePendingSignup,
+} from './lib/pending.mjs'
 import { rateLimit } from './lib/ratelimit.mjs'
 import { loadKeys, importFromCliKeystore, createWallet, removeWallet, keypairFor } from './lib/keys.mjs'
 import { bcs } from '@haneullabs/haneul/bcs'
@@ -327,8 +331,11 @@ async function isDeniedName(label) {
   }
   return false
 }
-// 'grace.hum.haneul' → 레지스트리 테이블에서 NameRecord 조회 (labels는 TLD-first)
-async function chainNameRecord(handle) {
+// 'grace.hum.haneul' → 레지스트리 테이블에서 NameRecord 조회 (labels는 TLD-first).
+// strict=false: 조회 실패를 부재(null)로 뭉갠다 (읽기 경로의 관용 동작).
+// strict=true: 실패를 그대로 던진다. 가입 화해처럼 "부재 확인"이 지갑 롤백의
+// 근거가 되는 곳은 실패와 부재를 구분해야 한다.
+async function chainNameRecord(handle, { strict = false } = {}) {
   const labels = String(handle || '').toLowerCase().split('.').reverse()
   if (labels.length < 2 || labels[0] !== 'haneul') return null
   try {
@@ -341,7 +348,8 @@ async function chainNameRecord(handle) {
     const target = deepFind(rec, 'target_address')
     if (target === undefined) return null
     return { target }
-  } catch {
+  } catch (e) {
+    if (strict) throw e
     return null
   }
 }
@@ -697,6 +705,10 @@ xrpc('post', 'com.atproto.server.createAccount', async req => {
 
   // ① 새 지갑 — 인프로세스 키 생성, 파사드 키 저장소에 등록 (비수탁 전환 전까지의 수탁 데모)
   const { address } = createWallet()
+  // 체인 등록 성공 후 ACCOUNTS 기록 전에 죽으면 "고아 지갑 + 영구 소진 핸들"이 남는다:
+  // 체인 호출 전에 pending으로 남겨 부팅 화해(reconcileSignups)가 계정을 입양하게 한다
+  const passwordHash = await hashPassword(password)
+  addPendingSignup({ handle: h, address, passwordHash, ts: Date.now() })
   try {
     if (IS_LOCALNET) {
       // ② 가스 지급(로컬넷 faucet) ③ 닉네임 발급 — hum.haneul 부모 NFT 소유자(앱 지갑)가
@@ -714,6 +726,7 @@ xrpc('post', 'com.atproto.server.createAccount', async req => {
   } catch (e) {
     // 온체인 등록 실패(동시 가입으로 leaf 선점 등) → 방금 만든 키 롤백, 고아 키 방지
     removeWallet(address)
+    removePendingSignup(h)
     throw e
   }
   const acct = {
@@ -722,11 +735,12 @@ xrpc('post', 'com.atproto.server.createAccount', async req => {
     address,
     displayName: name,
     description: 'New on Humming',
-    passwordHash: await hashPassword(password),
+    passwordHash,
     signup: true,
   }
   ACCOUNTS.push(acct)
   persistAccounts()
+  removePendingSignup(h)
   console.log(`🐣 가입: ${acct.handle} → 지갑 ${acct.address.slice(0, 10)}… (온체인 leaf 등록)`)
   return {
     ...sessionTokens(acct.did),
@@ -1361,8 +1375,10 @@ xrpc('post', 'app.humming.monetization.subscribe', async req => {
     key: `sub|${viewer.address}|${tierId}`,
     windowMs: 60_000,
   })
-  const { digest } = await idempotent(idem.key, idem.windowMs, () =>
-    execTx(viewer.address, buildSubscribe(tierId, price, viewer.address), 'Subscribed'),
+  const { digest } = await idempotent(idem.keys, idem.windowMs, () =>
+    withPendingTx(idem.contextKey, 'subscribe', { tier: tierId, price }, onDigest =>
+      execTx(viewer.address, buildSubscribe(tierId, price, viewer.address), 'Subscribed', { onDigest }),
+    ),
   )
   console.log(`💳 구독: ${viewer.handle} → ${creator.handle} (${price / 1e9} HANEUL) tx=${digest}`)
   return { digest, priceGeunhwa: price }
@@ -1393,8 +1409,10 @@ xrpc('post', 'app.humming.monetization.purchasePost', async req => {
     key: `ppv|${viewer.address}|${postId}`,
     windowMs: 60_000,
   })
-  const { digest } = await idempotent(idem.key, idem.windowMs, () =>
-    execTx(viewer.address, buildPurchase(pw.paywall, price, viewer.address), 'PostPurchased'),
+  const { digest } = await idempotent(idem.keys, idem.windowMs, () =>
+    withPendingTx(idem.contextKey, 'purchase', { paywall: pw.paywall, price }, onDigest =>
+      execTx(viewer.address, buildPurchase(pw.paywall, price, viewer.address), 'PostPurchased', { onDigest }),
+    ),
   )
   console.log(`🎟️ 단건 구매: ${viewer.handle} → post ${postId} (${price / 1e9} HANEUL) tx=${digest}`)
   return { digest, priceGeunhwa: price, postId }
@@ -1425,8 +1443,10 @@ xrpc('post', 'app.humming.monetization.tip', async req => {
     key: `tip|${viewer.address}|${creator.address}|${postId ?? ''}|${amount}`,
     windowMs: 20_000,
   })
-  const { digest } = await idempotent(idem.key, idem.windowMs, () =>
-    execTx(viewer.address, buildTip(creator.address, postId, amount, viewer.address), 'TipSent'),
+  const { digest } = await idempotent(idem.keys, idem.windowMs, () =>
+    withPendingTx(idem.contextKey, 'tip', { to: creator.address, postId, amount }, onDigest =>
+      execTx(viewer.address, buildTip(creator.address, postId, amount, viewer.address), 'TipSent', { onDigest }),
+    ),
   )
   console.log(`💰 팁: ${viewer.handle} → ${creator.handle}${postId ? ` (post ${postId})` : ''} (${amount / 1e9} HANEUL) tx=${digest}`)
   return { digest, amountGeunhwa: amount }
@@ -1583,6 +1603,42 @@ app.listen(PORT, () => {
 // 복원이 전부 끝나야 서빙 개방(chainReady) — 부분 인덱스로 잠금을 판정하지 않는다.
 // 실패 시 성공할 때까지 재시도: 체인이 내려간 동안 503은 의도된 동작(누출보다 다운타임).
 // initIndex는 재호출 안전(리플레이·재구성 모두 멱등).
+// 가입 크래시 창 화해: pending 가입 레코드를 체인과 대조한다.
+// leaf가 우리 지갑으로 등록돼 있으면 계정을 입양하고(핸들·지갑 복구),
+// 부재가 확인되면 지갑 키를 롤백한다. 조회 실패는 다음 부팅에 재시도.
+async function reconcileSignups() {
+  for (const rec of loadPendingSignups()) {
+    if (byHandle(rec.handle)) {
+      removePendingSignup(rec.handle)
+      continue
+    }
+    let onchain
+    try {
+      onchain = await chainNameRecord(rec.handle, { strict: true })
+    } catch (e) {
+      console.warn(`   ⚠️ 가입 pending ${rec.handle} 체인 확인 실패 (다음 부팅에 재시도): ${e.message}`)
+      continue
+    }
+    if (onchain && onchain.target === rec.address) {
+      ACCOUNTS.push({
+        handle: rec.handle,
+        did: `did:web:${rec.handle}`,
+        address: rec.address,
+        displayName: rec.handle.slice(0, -'.hum.haneul'.length),
+        description: 'New on Humming',
+        passwordHash: rec.passwordHash,
+        signup: true,
+      })
+      persistAccounts()
+      console.log(`🐣 가입 복구: ${rec.handle} → 지갑 ${rec.address.slice(0, 10)}… (크래시로 누락된 계정 입양)`)
+    } else {
+      // 부재 확인(또는 남의 주소로 등록): 체인 등록 전에 죽은 가입, 키 롤백
+      removeWallet(rec.address)
+    }
+    removePendingSignup(rec.handle)
+  }
+}
+
 for (;;) {
   try {
     await initIndex(ACCOUNTS.map(a => a.address))
@@ -1591,6 +1647,15 @@ for (;;) {
     console.error('   ⚠️ 인덱스 복원 실패, 5초 후 재시도:', e.message)
     await new Promise(r => setTimeout(r, 5000))
   }
+}
+// 결제 pending·가입 pending의 부팅 화해. 실패해도 서빙은 연다 (레코드는 남아
+// 재시도·다음 부팅이 처리하고, 미해결 결제 레코드는 요청 경로에서도 재판정된다)
+try {
+  const { kept } = await reconcilePendingTxs()
+  if (kept) console.log(`   ⏳ 미해결 결제 pending ${kept}건 유지 (재시도 시 체인 대조)`)
+  await reconcileSignups()
+} catch (e) {
+  console.warn(`   ⚠️ pending 화해 실패: ${e.message}`)
 }
 chainReady = true
 console.log(`   ⛓️  인덱스 복원 완료, 서빙 개방: ${stats()}`)
