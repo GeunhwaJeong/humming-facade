@@ -10,7 +10,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  NETWORK, RPC_URL, IS_LOCALNET, MAINNET_CHAIN_ID, PKG, NS_PKG, APP_WALLET, HANEUL_TYPE,
+  NETWORK, RPC_URL, IS_LOCALNET, MAINNET_CHAIN_ID, PKG, NS_PKG, NS_OBJ, APP_WALLET, HANEUL_TYPE,
   DENY_RESERVED_TABLE, DENY_BLOCKED_TABLE,
 } from './lib/config.mjs'
 import { verifyJwt, sessionTokens, hashPassword, verifyPassword, DUMMY_HASH } from './lib/auth.mjs'
