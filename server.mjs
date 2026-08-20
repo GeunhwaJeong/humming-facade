@@ -20,7 +20,7 @@ import {
 } from './lib/policy.mjs'
 import { revokeSession, isRevoked, tokenId } from './lib/revocation.mjs'
 import { writeFileAtomic } from './lib/atomic.mjs'
-import { noteChange as noteBackupChange, startBackups } from './lib/backup.mjs'
+import { noteChange as noteBackupChange, startBackups, flushBackups } from './lib/backup.mjs'
 import { idempotent, idempotencyKeyFor } from './lib/idempotency.mjs'
 import {
   withPendingTx, reconcilePendingTxs,
@@ -38,7 +38,9 @@ import {
 } from './lib/chain.mjs'
 import {
   state as chainState, stateVersion, gateView, initIndex, startTailing, stats,
+  tailingHealth, stopTailing, flushCursor,
 } from './lib/indexer.mjs'
+import { newRequestId, auditMoney } from './lib/audit.mjs'
 
 const PORT = Number(process.env.PORT ?? 3025)
 // 미디어 서명 URL에 박히는 외부 노출 주소 — 배포 시 HUMMING_PUBLIC_URL 필수(부팅 가드가 강제)
@@ -593,8 +595,17 @@ app.use('/xrpc', (req, res, next) => {
   res.setHeader('Retry-After', '2')
   res.status(503).json({ error: 'ServiceUnavailable', message: 'Warming up: chain index backfill in progress' })
 })
+// 테일링 랙 임계: 이보다 오래 스트림이 침묵하면 인덱스가 낡아지고 있다고 본다.
+// degraded여도 200은 유지한다 (LB가 노드를 뺐다 넣었다 하는 플래핑 방지),
+// 모니터링은 degraded 필드와 lagSeconds를 본다.
+const TAILING_DEGRADED_S = Number(process.env.HUMMING_TAILING_DEGRADED_S ?? 120)
 app.get('/health', (req, res) => {
-  res.status(chainReady ? 200 : 503).json({ ready: chainReady, ...(chainReady && { events: stats() }) })
+  const t = tailingHealth()
+  const degraded = chainReady && (t.lagSeconds == null || t.lagSeconds > TAILING_DEGRADED_S)
+  res.status(chainReady ? 200 : 503).json({
+    ready: chainReady,
+    ...(chainReady && { events: stats(), ...t, degraded }),
+  })
 })
 
 // ---- 인증 표면 레이트리밋 ----
@@ -1355,6 +1366,21 @@ xrpc('get', 'app.humming.monetization.getCreator', async req => {
   }
 })
 
+// 결제 연산 감사 래퍼: 연산 1건당 요청 ID를 발급하고 성공(digest 포함)·실패를
+// 감사 로그(lib/audit)에 한 줄씩 남긴다. 실패도 남아야 중복 결제 분쟁을 재구성한다.
+async function auditedMoney(op, viewer, fields, fn) {
+  const reqId = newRequestId()
+  const base = { reqId, op, did: viewer.did, address: viewer.address, ...fields }
+  try {
+    const result = await fn()
+    auditMoney({ ...base, digest: result.digest, ...(result.prior && { prior: true }), outcome: 'success' })
+    return result
+  } catch (e) {
+    auditMoney({ ...base, outcome: 'error', error: e.message })
+    throw e
+  }
+}
+
 // 구독 결제: 뷰어 지갑이 서명 → subscriptions::subscribe (95/5 온체인 분배)
 xrpc('post', 'app.humming.monetization.subscribe', async req => {
   const viewer = requireAuthAcct(req)
@@ -1389,10 +1415,16 @@ xrpc('post', 'app.humming.monetization.subscribe', async req => {
     key: `sub|${viewer.address}|${tierId}`,
     windowMs: 60_000,
   })
-  const { digest } = await idempotent(idem.keys, idem.windowMs, () =>
-    withPendingTx(idem.contextKey, 'subscribe', { tier: tierId, price }, onDigest =>
-      execTx(viewer.address, buildSubscribe(tierId, price, viewer.address), 'Subscribed', { onDigest }),
-    ),
+  const { digest } = await auditedMoney(
+    'subscribe',
+    viewer,
+    { creator: creator.address, amountGeunhwa: price },
+    () =>
+      idempotent(idem.keys, idem.windowMs, () =>
+        withPendingTx(idem.contextKey, 'subscribe', { tier: tierId, price }, onDigest =>
+          execTx(viewer.address, buildSubscribe(tierId, price, viewer.address), 'Subscribed', { onDigest }),
+        ),
+      ),
   )
   console.log(`💳 구독: ${viewer.handle} → ${creator.handle} (${price / 1e9} HANEUL) tx=${digest}`)
   return { digest, priceGeunhwa: price }
@@ -1423,10 +1455,16 @@ xrpc('post', 'app.humming.monetization.purchasePost', async req => {
     key: `ppv|${viewer.address}|${postId}`,
     windowMs: 60_000,
   })
-  const { digest } = await idempotent(idem.keys, idem.windowMs, () =>
-    withPendingTx(idem.contextKey, 'purchase', { paywall: pw.paywall, price }, onDigest =>
-      execTx(viewer.address, buildPurchase(pw.paywall, price, viewer.address), 'PostPurchased', { onDigest }),
-    ),
+  const { digest } = await auditedMoney(
+    'purchasePost',
+    viewer,
+    { postId, amountGeunhwa: price },
+    () =>
+      idempotent(idem.keys, idem.windowMs, () =>
+        withPendingTx(idem.contextKey, 'purchase', { paywall: pw.paywall, price }, onDigest =>
+          execTx(viewer.address, buildPurchase(pw.paywall, price, viewer.address), 'PostPurchased', { onDigest }),
+        ),
+      ),
   )
   console.log(`🎟️ 단건 구매: ${viewer.handle} → post ${postId} (${price / 1e9} HANEUL) tx=${digest}`)
   return { digest, priceGeunhwa: price, postId }
@@ -1457,10 +1495,16 @@ xrpc('post', 'app.humming.monetization.tip', async req => {
     key: `tip|${viewer.address}|${creator.address}|${postId ?? ''}|${amount}`,
     windowMs: 20_000,
   })
-  const { digest } = await idempotent(idem.keys, idem.windowMs, () =>
-    withPendingTx(idem.contextKey, 'tip', { to: creator.address, postId, amount }, onDigest =>
-      execTx(viewer.address, buildTip(creator.address, postId, amount, viewer.address), 'TipSent', { onDigest }),
-    ),
+  const { digest } = await auditedMoney(
+    'tip',
+    viewer,
+    { creator: creator.address, postId, amountGeunhwa: amount },
+    () =>
+      idempotent(idem.keys, idem.windowMs, () =>
+        withPendingTx(idem.contextKey, 'tip', { to: creator.address, postId, amount }, onDigest =>
+          execTx(viewer.address, buildTip(creator.address, postId, amount, viewer.address), 'TipSent', { onDigest }),
+        ),
+      ),
   )
   console.log(`💰 팁: ${viewer.handle} → ${creator.handle}${postId ? ` (post ${postId})` : ''} (${amount / 1e9} HANEUL) tx=${digest}`)
   return { digest, amountGeunhwa: amount }
@@ -1609,11 +1653,36 @@ if (!IS_LOCALNET && !keypairFor(APP_WALLET)) {
   process.exit(1)
 }
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`🚀 Humming XRPC 파사드: http://localhost:${PORT} (public: ${PUBLIC_URL})`)
   console.log(`   체인: ${RPC_URL} / 패키지: ${PKG.slice(0, 10)}…`)
   if (!chainReady) console.log('   ⏳ 인덱스 복원 완료 전까지 XRPC는 503 (fail-closed)')
 })
+
+// ---- 우아한 종료: 새 연결 차단 → 인플라이트 드레인 → 상태 플러시 → 종료 ----
+// 배포 재시작(systemd SIGTERM)이 진행 중 결제 요청을 자르지 않게 한다.
+// 결제 pending·감사 로그는 동기 append라 별도 플러시가 필요 없다.
+let shuttingDown = false
+async function shutdown(signal) {
+  if (shuttingDown) return
+  shuttingDown = true
+  console.log(`   ${signal} 수신: 새 연결을 닫고 진행 중 요청을 드레인합니다`)
+  stopTailing()
+  await Promise.race([
+    new Promise(resolve => server.close(resolve)),
+    // 드레인 상한: 이 이상 붙잡는 연결은 포기한다 (keep-alive 소켓 등)
+    new Promise(resolve => {
+      const t = setTimeout(resolve, 10_000)
+      t.unref?.()
+    }),
+  ])
+  flushCursor()
+  flushBackups()
+  console.log('   상태 플러시 완료, 종료합니다')
+  process.exit(0)
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'))
+process.on('SIGINT', () => shutdown('SIGINT'))
 // 복원이 전부 끝나야 서빙 개방(chainReady) — 부분 인덱스로 잠금을 판정하지 않는다.
 // 실패 시 성공할 때까지 재시도: 체인이 내려간 동안 503은 의도된 동작(누출보다 다운타임).
 // initIndex는 재호출 안전(리플레이·재구성 모두 멱등).
