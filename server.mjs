@@ -10,7 +10,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  NETWORK, RPC_URL, IS_LOCALNET, EXPECTED_CHAIN_ID, PRODUCTION_CHAIN_IDS, PKG, NS_PKG, NS_SUB_PKG, NS_OBJ, APP_WALLET, COIN_TYPE, HANDLE_DOMAIN,
+  NETWORK, RPC_URL, IS_LOCALNET, EXPECTED_CHAIN_ID, PRODUCTION_CHAIN_IDS, PKG, NS_PKG, NS_SUB_PKG, NS_OBJ, APP_WALLET, COIN_TYPE, HANDLE_DOMAIN, COIN_UNIT, COIN_SYMBOL,
   DENY_RESERVED_TABLE, DENY_BLOCKED_TABLE,
 } from './lib/config.mjs'
 import { verifyJwt, sessionTokens, hashPassword, verifyPassword, DUMMY_HASH } from './lib/auth.mjs'
@@ -538,7 +538,7 @@ function gatePosts(posts, viewerAcct, gate) {
       return embed ? { ...item, post: { ...item.post, embed } } : item
     }
     const tier = gate.tierByCreator.get(item.author.address) || null
-    const priceH = pw ? Number(pw.price) / 1e9 : null
+    const priceH = pw ? Number(pw.price) / COIN_UNIT : null
     // 비자격자에겐 개수/종류만 티저로 남긴다 (전환 유도, OnlyFans와 동일한 메커니즘)
     return {
       ...item,
@@ -1121,7 +1121,7 @@ async function submitPostOnChain(acct, text, parentId, media, paywallGeunhwa, la
   if (paywall && !events.some(e => e.type.endsWith('::PaywallCreated')))
     throw new Error(`Paywall creation failed (tx: ${digest})`)
   console.log(
-    `⛓️  쓰기: post_id=${postId} by ${acct.handle}${paywall ? ` [유료 ${paywall / 1e9} HANEUL]` : ''} tx=${digest}`,
+    `⛓️  쓰기: post_id=${postId} by ${acct.handle}${paywall ? ` [유료 ${paywall / COIN_UNIT} ${COIN_SYMBOL}]` : ''} tx=${digest}`,
   )
   return { postId, digest }
 }
@@ -1429,7 +1429,7 @@ xrpc('post', 'app.humming.monetization.subscribe', async req => {
         ),
       ),
   )
-  console.log(`💳 구독: ${viewer.handle} → ${creator.handle} (${price / 1e9} HANEUL) tx=${digest}`)
+  console.log(`💳 구독: ${viewer.handle} → ${creator.handle} (${price / COIN_UNIT} ${COIN_SYMBOL}) tx=${digest}`)
   return { digest, priceGeunhwa: price }
 })
 
@@ -1469,7 +1469,7 @@ xrpc('post', 'app.humming.monetization.purchasePost', async req => {
         ),
       ),
   )
-  console.log(`🎟️ 단건 구매: ${viewer.handle} → post ${postId} (${price / 1e9} HANEUL) tx=${digest}`)
+  console.log(`🎟️ 단건 구매: ${viewer.handle} → post ${postId} (${price / COIN_UNIT} ${COIN_SYMBOL}) tx=${digest}`)
   return { digest, priceGeunhwa: price, postId }
 })
 
@@ -1509,7 +1509,7 @@ xrpc('post', 'app.humming.monetization.tip', async req => {
         ),
       ),
   )
-  console.log(`💰 팁: ${viewer.handle} → ${creator.handle}${postId ? ` (post ${postId})` : ''} (${amount / 1e9} HANEUL) tx=${digest}`)
+  console.log(`💰 팁: ${viewer.handle} → ${creator.handle}${postId ? ` (post ${postId})` : ''} (${amount / COIN_UNIT} ${COIN_SYMBOL}) tx=${digest}`)
   return { digest, amountGeunhwa: amount }
 })
 
@@ -1527,7 +1527,8 @@ xrpc('post', 'app.humming.creator.becomeCreator', async req => {
     throw e
   }
   // 가드레일: 0.01 ~ 100 HANEUL / 1~365일
-  if (!(price >= 10_000_000 && price <= 100_000_000_000)) fail(400, 'Subscription price must be between 0.01 and 100 HANEUL')
+  if (!(price >= COIN_UNIT / 100 && price <= 100 * COIN_UNIT))
+    fail(400, `Subscription price must be between 0.01 and 100 ${COIN_SYMBOL}`)
   if (!(periodDays >= 1 && periodDays <= 365)) fail(400, 'Subscription period must be between 1 and 365 days')
   if (!['open', 'tease', 'lock'].includes(lockMode)) fail(400, 'lockMode must be one of open/tease/lock')
   const gate = await loadGateState()
@@ -1544,7 +1545,7 @@ xrpc('post', 'app.humming.creator.becomeCreator', async req => {
   // KYC 스텁 통과 → 인증 크리에이터 배지
   viewer.verified = true
   persistAccounts()
-  console.log(`🎨 크리에이터 전환: ${viewer.handle} (${price / 1e9} HANEUL/${periodDays}일, ${lockMode}) tx=${digest}`)
+  console.log(`🎨 크리에이터 전환: ${viewer.handle} (${price / COIN_UNIT} ${COIN_SYMBOL}/${periodDays}일, ${lockMode}) tx=${digest}`)
   return { digest, tier: { priceGeunhwa: price, periodMs }, lockMode, verified: true }
 })
 
