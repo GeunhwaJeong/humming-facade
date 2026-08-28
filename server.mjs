@@ -34,8 +34,12 @@ import { grpcClient } from './lib/client.mjs'
 import { chainIdentifier, getObjectJson, listAllDynamicFields } from './lib/grpc.mjs'
 import {
   execTx, faucet, buildStarterGas,
-  buildNewLeaf, buildCreatePost, buildSubscribe, buildPurchase, buildTip, buildBecomeCreator,
+  buildNewLeaf, buildCreatePost, buildDeletePost, buildSubscribe, buildPurchase, buildTip, buildBecomeCreator,
 } from './lib/chain.mjs'
+import { encodeContent, decodeContent } from './lib/content.mjs'
+import {
+  checkReport, appendReport, listReports, isHidden, hiddenEntry, hidePost, unhidePost, listHidden,
+} from './lib/moderation.mjs'
 import {
   state as chainState, stateVersion, gateView, initIndex, startTailing, stats,
   tailingHealth, stopTailing, flushCursor,
@@ -65,49 +69,7 @@ function mediaUrl(cid) {
   return `${PUBLIC_URL}/media/${cid}?exp=${exp}&sig=${signMedia(cid, exp)}`
 }
 
-// content_uri 인코딩: 본문 뒤에 미디어 포인터·언어 태그를 덧붙임 (CID 전달 규약)
-// 형식: <text>[ §media:...][ §langs:ko,en] — 마커는 항상 이 순서로 뒤에 온다
-const MEDIA_MARK = ' §media:'
-const LANGS_MARK = ' §langs:'
-// BCP-47 형태만 통과 (컴포저 언어 선택값), 최대 3개 — ATProto post.langs 상한과 동일
-function cleanLangs(langs) {
-  if (!Array.isArray(langs)) return []
-  return langs
-    .filter(l => typeof l === 'string' && /^[a-zA-Z]{2,3}(-[a-zA-Z0-9]{2,8})*$/.test(l))
-    .slice(0, 3)
-}
-function encodeContent(text, media, langs) {
-  let t = text || ''
-  if (media?.length)
-    t +=
-      MEDIA_MARK +
-      media.map(m => `${m.cid}~${m.mime.replace('/', '_')}~${m.w}x${m.h}`).join(',')
-  const ls = cleanLangs(langs)
-  if (ls.length) t += LANGS_MARK + ls.join(',')
-  return t
-}
-function decodeContent(raw) {
-  let rest = raw || ''
-  let langs = []
-  const li = rest.lastIndexOf(LANGS_MARK)
-  if (li >= 0) {
-    langs = cleanLangs(rest.slice(li + LANGS_MARK.length).split(','))
-    rest = rest.slice(0, li)
-  }
-  const i = rest.indexOf(MEDIA_MARK)
-  if (i < 0) return { text: rest, media: [], langs }
-  const media = rest
-    .slice(i + MEDIA_MARK.length)
-    .split(',')
-    .map(s => {
-      const [cid, mime, dims] = s.split('~')
-      const [w, h] = (dims || '').split('x').map(Number)
-      return { cid, mime: (mime || 'image_jpeg').replace('_', '/'), w: w || 0, h: h || 0 }
-    })
-    .filter(m => m.cid)
-  return { text: rest.slice(0, i), media, langs }
-}
-
+// content_uri 인코딩·디코딩(미디어 포인터·언어·셀프 라벨)은 lib/content.mjs — 단위 테스트 대상
 function imagesEmbedView(media) {
   const images = (media || []).filter(m => m.mime.startsWith('image/'))
   if (!images.length) return undefined
@@ -431,16 +393,21 @@ async function loadPosts() {
       const p = ev.parsedJson
       const acct = byAddress(p.author)
       if (!acct) return null
+      const postId = String(p.post_id)
+      // 작성자가 지운 글(온체인 deleted)과 운영자가 숨긴 글(파사드 목록)은 어떤 뷰에도 안 나간다
+      if (chainState.deletedPosts.has(postId) || isHidden(postId)) return null
       const createdAt = new Date(ev.timestampMs).toISOString()
-      const { text, media, langs } = decodeContent(p.content_uri)
+      const { text, media, langs, labels } = decodeContent(p.content_uri)
+      const uri = `at://${acct.did}/app.bsky.feed.post/${p.post_id}`
+      const cid = await fakeCid(ev.txDigest)
       return {
-        postId: String(p.post_id),
+        postId,
         repliedTo: p.replied_to,
         author: acct,
         media,
         post: {
-          uri: `at://${acct.did}/app.bsky.feed.post/${p.post_id}`,
-          cid: await fakeCid(ev.txDigest),
+          uri,
+          cid,
           author: profileBasic(acct),
           record: {
             $type: 'app.bsky.feed.post',
@@ -448,6 +415,9 @@ async function loadPosts() {
             createdAt,
             // 언어는 컴포저 선택값이 content_uri에 실려 온 것 — 없으면 필드 생략
             ...(langs.length ? { langs } : {}),
+            ...(labels.length
+              ? { labels: { $type: 'com.atproto.label.defs#selfLabels', values: labels.map(val => ({ val })) } }
+              : {}),
           },
           replyCount: 0,
           repostCount: 0,
@@ -456,7 +426,9 @@ async function loadPosts() {
           bookmarkCount: 0,
           indexedAt: createdAt,
           viewer: { threadMuted: false, embeddingDisabled: false },
-          labels: [],
+          // 셀프 라벨은 src=작성자 DID인 라벨로 내려간다 — 앱이 내장 정의(porn 등)로
+          // 뷰어의 성인 콘텐츠 설정에 따라 블러·숨김을 적용한다 (라벨러 불필요)
+          labels: labels.map(val => ({ src: acct.did, uri, cid, val, cts: createdAt })),
         },
       }
     }),
@@ -866,19 +838,34 @@ xrpc('get', 'app.bsky.actor.getProfiles', async req => {
   const profiles = await Promise.all(actors.map(a => detailedProfile(a).catch(() => null)))
   return { profiles: profiles.filter(Boolean) }
 })
-xrpc('get', 'app.bsky.actor.getPreferences', () => ({
-  preferences: [
-    {
-      $type: 'app.bsky.actor.defs#savedFeedsPrefV2',
-      items: [{ id: '3jui7kd54zh2y', type: 'timeline', value: 'following', pinned: true }],
-    },
-    {
-      $type: 'app.bsky.actor.defs#personalDetailsPref',
-      birthDate: '2000-01-01T00:00:00.000Z',
-    },
-  ],
+// 앱 설정(성인 콘텐츠 표시, 라벨별 가시성, 생년월일, 저장된 피드 등)은 계정에 영속된다.
+// 앱은 읽기-수정-쓰기로 전체 배열을 보내므로 그대로 저장한다. 저장된 피드 항목이 없으면
+// 기본 타임라인을 앞에 붙여 앱의 피드 탭이 비지 않게 한다. 생년월일은 가입 직후 앱이
+// setPersonalDetails로 보내는 값이 그대로 남는다 — 서버가 지어내지 않는다.
+const DEFAULT_SAVED_FEEDS = {
+  $type: 'app.bsky.actor.defs#savedFeedsPrefV2',
+  items: [{ id: '3jui7kd54zh2y', type: 'timeline', value: 'following', pinned: true }],
+}
+const MAX_PREFERENCES_BYTES = 64 * 1024
+function preferencesOf(acct) {
+  const stored = Array.isArray(acct?.preferences) ? acct.preferences : []
+  const hasFeeds = stored.some(p => p?.$type === 'app.bsky.actor.defs#savedFeedsPrefV2')
+  return hasFeeds ? stored : [DEFAULT_SAVED_FEEDS, ...stored]
+}
+xrpc('get', 'app.bsky.actor.getPreferences', req => ({
+  preferences: preferencesOf(byDid(didFromAuth(req))),
 }))
-xrpc('post', 'app.bsky.actor.putPreferences', () => ({}))
+xrpc('post', 'app.bsky.actor.putPreferences', req => {
+  const acct = requireAuthAcct(req)
+  const prefs = req.body?.preferences
+  if (!Array.isArray(prefs) || !prefs.every(p => p && typeof p === 'object' && typeof p.$type === 'string'))
+    httpError(400, 'InvalidRequest', 'preferences must be an array of typed objects')
+  if (JSON.stringify(prefs).length > MAX_PREFERENCES_BYTES)
+    httpError(400, 'InvalidRequest', 'preferences too large')
+  acct.preferences = prefs
+  if (acct.signup) persistAccounts()
+  return {}
+})
 
 // --- app.bsky.feed ---
 // 타임라인·피드 공용 페이지 응답: 전량이 아니라 요청 페이지만 게이팅해 서빙한다.
@@ -1095,7 +1082,7 @@ function tidNow() {
   return s
 }
 
-async function submitPostOnChain(acct, text, parentId, media, paywallGeunhwa, langs) {
+async function submitPostOnChain(acct, text, parentId, media, paywallGeunhwa, langs, labels) {
   // 본문 길이 상한: 앱은 300 grapheme에서 자르지만 API 직접 호출은 무제한이었다
   if (String(text ?? '').length > MAX_POST_TEXT_CHARS)
     httpError(400, 'InvalidRequest', `Post text must be at most ${MAX_POST_TEXT_CHARS} characters`)
@@ -1109,7 +1096,7 @@ async function submitPostOnChain(acct, text, parentId, media, paywallGeunhwa, la
   // 글 작성과 페이월 생성을 한 tx로 원자 확정 — 가격 없는 유료 글이 생길 틈이 없음
   const { digest, events } = await execTx(
     acct.address,
-    buildCreatePost(encodeContent(text, media, langs), parentId, paywall),
+    buildCreatePost(encodeContent(text, media, langs, labels), parentId, paywall),
     'PostCreated',
   )
   const postId = String(
@@ -1251,7 +1238,7 @@ xrpc('post', 'com.atproto.repo.applyWrites', async req => {
     if (isCreate && w.collection === 'app.bsky.feed.post') {
       const parentId = parentIdFromUri(w.value?.reply?.parent?.uri)
       const media = mediaFromEmbed(w.value?.embed)
-      const { postId, digest } = await submitPostOnChain(acct, w.value?.text, parentId, media, w.value?.humming?.paywallGeunhwa, w.value?.langs)
+      const { postId, digest } = await submitPostOnChain(acct, w.value?.text, parentId, media, w.value?.humming?.paywallGeunhwa, w.value?.langs, w.value?.labels)
       results.push({
         $type: 'com.atproto.repo.applyWrites#createResult',
         uri: `at://${acct.did}/app.bsky.feed.post/${postId}`,
@@ -1281,7 +1268,7 @@ xrpc('post', 'com.atproto.repo.createRecord', async req => {
   if (collection === 'app.bsky.feed.post') {
     const parentId = parentIdFromUri(record?.reply?.parent?.uri)
     const media = mediaFromEmbed(record?.embed)
-    const { postId, digest } = await submitPostOnChain(acct, record?.text, parentId, media, record?.humming?.paywallGeunhwa, record?.langs)
+    const { postId, digest } = await submitPostOnChain(acct, record?.text, parentId, media, record?.humming?.paywallGeunhwa, record?.langs, record?.labels)
     return {
       uri: `at://${acct.did}/app.bsky.feed.post/${postId}`,
       cid: await fakeCid(digest),
@@ -1299,8 +1286,42 @@ xrpc('post', 'com.atproto.repo.createRecord', async req => {
   }
 })
 
-// 미매핑 레코드 삭제(좋아요 취소 등)도 소프트 수용
-xrpc('post', 'com.atproto.repo.deleteRecord', () => ({}))
+// 글 삭제: 작성자 서명으로 온체인 delete_post (content_uri 비움 + deleted). 인덱스에는
+// PostDeleted가 동기 주입돼 다음 읽기부터 사라진다. 다른 살아있는 글이 참조하지 않는
+// 미디어 파일은 디스크에서도 지운다 — "삭제"가 콘텐츠 삭제여야 하는 법적 요건.
+// 그 외 컬렉션(좋아요 취소 등)은 미매핑이라 소프트 수용.
+xrpc('post', 'com.atproto.repo.deleteRecord', async req => {
+  const acct = requireAuthAcct(req)
+  const { collection, rkey } = req.body || {}
+  if (collection !== 'app.bsky.feed.post') return {}
+  const postId = String(rkey ?? '').match(/^\d+$/)?.[0]
+  if (!postId) httpError(400, 'InvalidRequest', 'rkey must be a post id')
+  const posts = await loadPosts()
+  const item = posts.find(p => p.postId === postId)
+  // 이미 지워졌거나 모르는 글: 재시도·중복 삭제는 성공으로 종결 (체인은 EPostNotFound로 거부)
+  if (!item) return {}
+  if (item.author.did !== acct.did) httpError(403, 'Forbidden', 'Only the author can delete this post')
+  const { digest } = await execTx(acct.address, buildDeletePost(postId), 'PostDeleted')
+  releaseMediaOf(item, await loadPosts())
+  console.log(`🗑️  삭제: post_id=${postId} by ${acct.handle} tx=${digest}`)
+  return {}
+})
+
+// 삭제된 글의 미디어 정리: 같은 CID를 아직 살아있는 다른 글이 쓰고 있으면 남긴다
+function releaseMediaOf(deleted, livePosts) {
+  for (const m of deleted.media) {
+    const stillUsed = livePosts.some(p => p.postId !== deleted.postId && p.media.some(x => x.cid === m.cid))
+    if (stillUsed) continue
+    const file = path.join(MEDIA_DIR, m.cid)
+    try {
+      const meta = JSON.parse(fs.readFileSync(`${file}.meta.json`, 'utf8'))
+      if (meta.owner && mediaUsage) mediaUsage.set(meta.owner, Math.max(0, (mediaUsage.get(meta.owner) || 0) - (Number(meta.size) || 0)))
+    } catch {}
+    fs.rmSync(file, { force: true })
+    fs.rmSync(`${file}.meta.json`, { force: true })
+    mediaMetaOwners.delete(m.cid)
+  }
+}
 
 // 프로필 저장(온보딩 마지막 단계·프로필 편집)은 계정 메타데이터에 반영, 그 외엔 수용만
 xrpc('post', 'com.atproto.repo.putRecord', async req => {
@@ -1632,6 +1653,54 @@ xrpc('get', 'app.humming.wallet.getInfo', async req => {
     balanceGeunhwa: Number(balance.balance),
     activity: items.slice(0, 20),
   }
+})
+
+// --- 신고: 유저가 운영자에게 보내는 메시지. 파사드 원장(reports.jsonl)에 남기고
+// 운영자 API로 열람한다. 처리(숨김·삭제 요청)는 운영자 판단이라 자동화하지 않는다.
+xrpc('post', 'com.atproto.moderation.createReport', req => {
+  const acct = requireAuthAcct(req)
+  const problem = checkReport(req.body || {})
+  if (problem) httpError(400, 'InvalidRequest', problem)
+  const rec = appendReport({ reportedBy: acct.did, ...req.body })
+  console.log(`🚩 신고: ${acct.handle} → ${rec.subject.uri ?? rec.subject.did} (${rec.reasonType})`)
+  return rec
+})
+
+// --- 운영자 API: HUMMING_ADMIN_TOKEN이 설정된 경우에만 열린다 ---
+// 숨김은 파사드 목록이라 체인 확정 없이 즉시 효력이고, 작성자 삭제와 달리 되돌릴 수 있다.
+// 누가·언제·왜가 hidden-posts 파일에 남고 백업된다.
+const ADMIN_TOKEN = process.env.HUMMING_ADMIN_TOKEN || null
+app.use('/admin', (req, res, next) => {
+  if (!ADMIN_TOKEN) return res.status(404).end()
+  const token = (req.headers.authorization || '').replace(/^Bearer /, '')
+  if (!token || !safeEqual(token, ADMIN_TOKEN))
+    return res.status(401).json({ error: 'Unauthorized', message: 'Admin token required' })
+  next()
+})
+app.get('/admin/reports', (req, res) => {
+  res.json({ reports: listReports(clampLimit(req.query.limit)) })
+})
+app.get('/admin/hidden', (req, res) => {
+  res.json({ hidden: listHidden() })
+})
+app.post('/admin/hide', async (req, res) => {
+  const postId = String(req.body?.postId ?? '').match(/^\d+$/)?.[0]
+  if (!postId) return res.status(400).json({ error: 'InvalidRequest', message: 'postId required' })
+  const posts = await loadPosts()
+  if (!posts.some(p => p.postId === postId) && !hiddenEntry(postId))
+    return res.status(404).json({ error: 'NotFound', message: 'No such live post' })
+  const rec = hidePost(postId, { by: 'admin', reason: String(req.body?.reason ?? '').slice(0, 500) })
+  postCacheVersion = -1 // 다음 읽기에서 캐시 재구성 (숨김은 인덱스 버전을 안 올린다)
+  console.log(`🙈 운영자 숨김: post_id=${postId} (${rec.reason || '사유 없음'})`)
+  res.json({ postId, ...rec })
+})
+app.post('/admin/unhide', (req, res) => {
+  const postId = String(req.body?.postId ?? '').match(/^\d+$/)?.[0]
+  if (!postId) return res.status(400).json({ error: 'InvalidRequest', message: 'postId required' })
+  const ok = unhidePost(postId)
+  if (ok) postCacheVersion = -1
+  console.log(`👁️  운영자 숨김 해제: post_id=${postId} (${ok ? '해제' : '목록에 없음'})`)
+  res.json({ postId, unhidden: ok })
 })
 
 // --- catch-all: log what the app asks for, fail soft ---
