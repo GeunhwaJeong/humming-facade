@@ -50,6 +50,16 @@ State backups: the facade snapshots its durable state (key store, accounts, JWT 
 
 Other environment variables: `PORT` (default 3025), `HUMMING_GRPC_URL` (defaults to `HUMMING_RPC_URL`; the full node serves gRPC multiplexed on the same port), `HUMMING_MEDIA_DIR`, `HUMMING_FAUCET_URL`, `HUMMING_TRUST_PROXY=1` (only behind a reverse proxy), and rate limit tuning: `HUMMING_LOGIN_IP_LIMIT` (20 per 5 min), `HUMMING_LOGIN_ACCT_LIMIT` (10 per 15 min), `HUMMING_SIGNUP_IP_LIMIT` (5 per hour), `HUMMING_MAX_SIGNUPS_PER_DAY` (200). Rate limits are effectively lifted on localnet so they never get in the way of E2E runs.
 
+## Moderation
+
+The product allows adult content and moderates hard, so the serving layer has the four levers that policy needs:
+
+- **Delete**: `com.atproto.repo.deleteRecord` on a post calls `feed::delete_post` with the author's key (the chain enforces authorship), the index drops the post on the `PostDeleted` event, and media files no live post still references are removed from `media/`.
+- **Self-labels**: the composer's content warnings (`porn`, `sexual`, `nudity`, `graphic-media`) are stored with the post (`§labels:` marker in `content_uri`, see `lib/content.mjs`) and returned as labels with `src` = the author's DID, so the app's built-in adult-content handling applies. Other label values are dropped.
+- **Preferences**: `app.bsky.actor.putPreferences` persists the app's preference array per account (adult content toggle, per-label visibility, saved feeds, the birth date the user gave at signup). Nothing is fabricated server-side.
+- **Reports**: `com.atproto.moderation.createReport` appends to `reports.<network>.jsonl`.
+- **Operator hide**: with `HUMMING_ADMIN_TOKEN` set, `GET /admin/reports`, `GET /admin/hidden`, `POST /admin/hide {postId, reason}` and `POST /admin/unhide {postId}` (bearer token) manage `hidden-posts.<network>.json`. Hidden posts leave every view immediately without a chain transaction and can be restored. Both files are backed up with the rest of the state.
+
 ## E2E
 
 The `e2e-*.mjs` scripts drive the real web app with Playwright to verify the main scenarios: signup, subscription paywall, fully locked profiles, media gating, and single-post purchase. The `e2e-*.png` files are execution evidence for each scenario.

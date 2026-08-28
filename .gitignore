@@ -24,3 +24,5 @@ indexer-cursor.*.json
 pending-tx.*.jsonl
 pending-signups.*.json
 revoked-sessions.*.json
+reports.*.jsonl
+hidden-posts.*.json
