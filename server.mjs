@@ -690,7 +690,7 @@ function xrpc(method, nsid, handler) {
 // --- com.atproto.server ---
 xrpc('get', 'com.atproto.server.describeServer', () => ({
   did: 'did:web:localhost',
-  availableUserDomains: ['.hum.haneul'],
+  availableUserDomains: [`.${HANDLE_DOMAIN}`],
 }))
 
 // 가입 = 닉네임 = 지갑: 앱의 표준 가입 화면이 이 엔드포인트 하나로 온체인 신원을 만든다.
