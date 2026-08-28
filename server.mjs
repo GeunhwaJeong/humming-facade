@@ -10,7 +10,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  NETWORK, RPC_URL, IS_LOCALNET, EXPECTED_CHAIN_ID, PRODUCTION_CHAIN_IDS, PKG, NS_PKG, NS_OBJ, APP_WALLET, COIN_TYPE,
+  NETWORK, RPC_URL, IS_LOCALNET, EXPECTED_CHAIN_ID, PRODUCTION_CHAIN_IDS, PKG, NS_PKG, NS_SUB_PKG, NS_OBJ, APP_WALLET, COIN_TYPE, HANDLE_DOMAIN,
   DENY_RESERVED_TABLE, DENY_BLOCKED_TABLE,
 } from './lib/config.mjs'
 import { verifyJwt, sessionTokens, hashPassword, verifyPassword, DUMMY_HASH } from './lib/auth.mjs'
@@ -186,7 +186,7 @@ const byDid = d => ACCOUNTS.find(a => a.did === d)
 // 가입으로 생긴 계정은 accounts 파일로 존속 (재시작 생존; 시드 계정과 병합).
 // 네트워크별 분리 — 로컬넷 regenesis 청소가 메인넷 계정 파일을 건드리지 못하게 한다.
 const ACCOUNTS_FILE = new URL(
-  NETWORK === 'mainnet' ? './accounts.mainnet.json' : './accounts.json',
+  NETWORK === 'localnet' ? './accounts.json' : `./accounts.${NETWORK}.json`,
   import.meta.url,
 )
 try {
@@ -338,9 +338,11 @@ async function isDeniedName(label) {
 // strict=false: 조회 실패를 부재(null)로 뭉갠다 (읽기 경로의 관용 동작).
 // strict=true: 실패를 그대로 던진다. 가입 화해처럼 "부재 확인"이 지갑 롤백의
 // 근거가 되는 곳은 실패와 부재를 구분해야 한다.
+const HANDLE_TLD = HANDLE_DOMAIN.split('.').pop()
 async function chainNameRecord(handle, { strict = false } = {}) {
+  if (!NS_OBJ) return null // NS 미구성(SuiNS 통합 전) — 온체인 이름 원장 없음
   const labels = String(handle || '').toLowerCase().split('.').reverse()
-  if (labels.length < 2 || labels[0] !== 'haneul') return null
+  if (labels.length < 2 || labels[0] !== HANDLE_TLD) return null
   try {
     const table = await getNsRegistryTable()
     const rec = await dynamicFieldJson(
@@ -706,8 +708,8 @@ xrpc('post', 'com.atproto.server.createAccount', async req => {
   const pwProblem = checkNewPassword(password)
   if (pwProblem) fail(400, 'InvalidPassword', pwProblem)
   const h = String(handle).toLowerCase()
-  if (!h.endsWith('.hum.haneul')) fail(400, 'UnsupportedDomain', 'handle must end with .hum.haneul')
-  const name = h.slice(0, -'.hum.haneul'.length)
+  if (!h.endsWith(`.${HANDLE_DOMAIN}`)) fail(400, 'UnsupportedDomain', `handle must end with .${HANDLE_DOMAIN}`)
+  const name = h.slice(0, -(HANDLE_DOMAIN.length + 1))
   // 온체인 제약과 동일: SubDomainConfig min_label_size=3, 라벨 문자셋
   if (!/^[a-z0-9][a-z0-9-]{1,28}[a-z0-9]$/.test(name))
     fail(400, 'InvalidHandle', 'Nicknames must be 3-30 characters of lowercase letters, digits, or hyphens')
@@ -726,12 +728,13 @@ xrpc('post', 'com.atproto.server.createAccount', async req => {
       // ② 가스 지급(로컬넷 faucet) ③ 닉네임 발급 — hum.haneul 부모 NFT 소유자(앱 지갑)가
       //    서명·가스 부담. APP_WALLET 서명 tx끼리만 직렬화되고 다른 지갑의 결제와는 병렬
       await faucet(address)
-      await execTx(APP_WALLET, buildNewLeaf(h, address))
+      if (NS_SUB_PKG) await execTx(APP_WALLET, buildNewLeaf(h, address))
     } else {
       // faucet 없는 체인: 닉네임 발급 + 스타터 가스를 APP_WALLET의 한 PTB로 원자 처리 —
-      // "이름만 등록된 무가스 지갑" 부분 실패 창이 없고, 지출 상한은 가입 레이트리밋이 건다
+      // "이름만 등록된 무가스 지갑" 부분 실패 창이 없고, 지출 상한은 가입 레이트리밋이 건다.
+      // NS 미구성 네트워크(SuiNS 통합 전)는 leaf를 생략하고 파사드 원장이 유일성을 진다
       await execTx(APP_WALLET, tx => {
-        buildNewLeaf(h, address)(tx)
+        if (NS_SUB_PKG) buildNewLeaf(h, address)(tx)
         buildStarterGas(address, STARTER_GEUNHWA)(tx)
       })
     }
