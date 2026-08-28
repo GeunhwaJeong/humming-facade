@@ -1105,8 +1105,8 @@ async function submitPostOnChain(acct, text, parentId, media, paywallGeunhwa, la
   // 페이월 가격은 서버가 재검증 (클라이언트 값 신뢰 금지): 0.01~100 HANEUL
   const paywall =
     Number.isFinite(Number(paywallGeunhwa)) &&
-    Number(paywallGeunhwa) >= 10_000_000 &&
-    Number(paywallGeunhwa) <= 100_000_000_000
+    Number(paywallGeunhwa) >= COIN_UNIT / 100 &&
+    Number(paywallGeunhwa) <= 100 * COIN_UNIT
       ? Math.floor(Number(paywallGeunhwa))
       : null
   // 글 작성과 페이월 생성을 한 tx로 원자 확정 — 가격 없는 유료 글이 생길 틈이 없음
