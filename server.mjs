@@ -11,7 +11,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   NETWORK, RPC_URL, IS_LOCALNET, EXPECTED_CHAIN_ID, PRODUCTION_CHAIN_IDS, PKG, NS_PKG, NS_SUB_PKG, NS_OBJ, APP_WALLET, COIN_TYPE, HANDLE_DOMAIN, COIN_UNIT, COIN_SYMBOL,
-  DENY_RESERVED_TABLE, DENY_BLOCKED_TABLE,
+  DENY_RESERVED_TABLE, DENY_BLOCKED_TABLE, SPONSOR_GAS,
 } from './lib/config.mjs'
 import { verifyJwt, sessionTokens, hashPassword, verifyPassword, DUMMY_HASH } from './lib/auth.mjs'
 import {
@@ -45,9 +45,16 @@ import { newRequestId, auditMoney } from './lib/audit.mjs'
 const PORT = Number(process.env.PORT ?? 3025)
 // 미디어 서명 URL에 박히는 외부 노출 주소 — 배포 시 HUMMING_PUBLIC_URL 필수(부팅 가드가 강제)
 const PUBLIC_URL = (process.env.HUMMING_PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/+$/, '')
-// 가입 스타터 가스(GEUNHWA) — faucet 없는 체인에서 APP_WALLET이 새 지갑에 지급하는 초기 금액.
-// 하루 지출 상한 = 이 값 × HUMMING_MAX_SIGNUPS_PER_DAY (기본 0.2 HANEUL × 200 = 40 HANEUL)
+// 가입 스타터 가스(가스 코인 최소 단위) — faucet 없는 체인에서 APP_WALLET이 새 지갑에 지급하는
+// 초기 금액. 하루 지출 상한 = 이 값 × HUMMING_MAX_SIGNUPS_PER_DAY (기본 0.2 × 200 = 40).
+// 스폰서드 가스 네트워크(SPONSOR_GAS)에서는 유저 지갑이 가스를 낼 일이 없으므로 지급하지
+// 않는다 — 지급하면 가입당 현금이 새고, 가입 리밋이 곧 드레인 상한이 된다.
 const STARTER_GEUNHWA = BigInt(process.env.HUMMING_STARTER_GEUNHWA ?? 200_000_000)
+const STARTER_GAS_ENABLED = !SPONSOR_GAS
+// 팁 1건 상한(표시 단위, 결제 통화 기준). 데시멀이 다른 통화에서도 같은 의미를 갖도록
+// COIN_UNIT으로 환산한다 — 최소 단위 상수를 박으면 6데시멀 통화에서 1000배가 된다.
+const TIP_MAX_UNITS = Number(process.env.HUMMING_TIP_MAX_UNITS ?? 100)
+const TIP_MAX = Math.floor(TIP_MAX_UNITS * COIN_UNIT)
 
 // ---- 미디어 저장소: 콘텐츠는 오프체인, 체인에는 CID 포인터만 ----
 // 파일 삭제 = 콘텐츠 삭제 가능(법적 요건), 체인의 CID는 존재 증명만 남음
@@ -219,11 +226,14 @@ if (!IS_LOCALNET) {
     fatal.push(
       'HUMMING_KEYS_PASSPHRASE 미설정 — 수탁 키 저장소가 평문으로 남습니다. 디스크/백업 유출 = 전 유저 자금 드레인.',
     )
-  // 스폰서 금액 오설정(단위 착오 등)이 그대로 지출 상한이 되는 것을 막는다: 0 초과 ~ 10 HANEUL
-  if (STARTER_GEUNHWA <= 0n || STARTER_GEUNHWA > 10_000_000_000n)
+  // 스폰서 금액 오설정(단위 착오 등)이 그대로 지출 상한이 되는 것을 막는다: 0 초과 ~ 10 가스 코인.
+  // 스폰서드 가스 네트워크는 스타터를 지급하지 않으므로 검사 대상이 아니다.
+  if (STARTER_GAS_ENABLED && (STARTER_GEUNHWA <= 0n || STARTER_GEUNHWA > 10_000_000_000n))
     fatal.push(
-      `HUMMING_STARTER_GEUNHWA=${STARTER_GEUNHWA} — 가입 스타터 금액은 GEUNHWA 단위로 0 초과 10 HANEUL 이하여야 합니다.`,
+      `HUMMING_STARTER_GEUNHWA=${STARTER_GEUNHWA} — 가입 스타터 금액은 가스 코인 최소 단위로 0 초과 10 코인 이하여야 합니다.`,
     )
+  if (!(TIP_MAX_UNITS > 0 && TIP_MAX_UNITS <= 10_000))
+    fatal.push(`HUMMING_TIP_MAX_UNITS=${TIP_MAX_UNITS} — 팁 상한은 표시 단위로 0 초과 10,000 이하여야 합니다.`)
   if (fatal.length) {
     console.error(`❌ 비로컬넷 체인(${RPC_URL})으로 부팅 거부:`)
     for (const m of fatal) console.error(`   - ${m}`)
@@ -729,15 +739,17 @@ xrpc('post', 'com.atproto.server.createAccount', async req => {
       //    서명·가스 부담. APP_WALLET 서명 tx끼리만 직렬화되고 다른 지갑의 결제와는 병렬
       await faucet(address)
       if (NS_SUB_PKG) await execTx(APP_WALLET, buildNewLeaf(h, address))
-    } else {
+    } else if (NS_SUB_PKG || STARTER_GAS_ENABLED) {
       // faucet 없는 체인: 닉네임 발급 + 스타터 가스를 APP_WALLET의 한 PTB로 원자 처리 —
       // "이름만 등록된 무가스 지갑" 부분 실패 창이 없고, 지출 상한은 가입 레이트리밋이 건다.
-      // NS 미구성 네트워크(SuiNS 통합 전)는 leaf를 생략하고 파사드 원장이 유일성을 진다
+      // NS 미구성 네트워크(SuiNS 통합 전)는 leaf를 생략하고 파사드 원장이 유일성을 진다.
+      // 스폰서드 가스 네트워크는 스타터를 생략한다 — 유저 지갑은 가스를 낼 일이 없다.
       await execTx(APP_WALLET, tx => {
         if (NS_SUB_PKG) buildNewLeaf(h, address)(tx)
-        buildStarterGas(address, STARTER_GEUNHWA)(tx)
+        if (STARTER_GAS_ENABLED) buildStarterGas(address, STARTER_GEUNHWA)(tx)
       })
     }
+    // (NS 미구성 + 스폰서드 가스: 가입은 체인 호출 없이 파사드 원장 등록만으로 끝난다)
   } catch (e) {
     // 온체인 등록 실패(동시 가입으로 leaf 선점 등) → 방금 만든 키 롤백, 고아 키 방지
     removeWallet(address)
@@ -756,7 +768,9 @@ xrpc('post', 'com.atproto.server.createAccount', async req => {
   ACCOUNTS.push(acct)
   persistAccounts()
   removePendingSignup(h)
-  console.log(`🐣 가입: ${acct.handle} → 지갑 ${acct.address.slice(0, 10)}… (온체인 leaf 등록)`)
+  console.log(
+    `🐣 가입: ${acct.handle} → 지갑 ${acct.address.slice(0, 10)}… (${NS_SUB_PKG ? '온체인 leaf 등록' : '파사드 원장'}${STARTER_GAS_ENABLED ? ', 스타터 가스' : ''})`,
+  )
   return {
     ...sessionTokens(acct.did),
     handle: acct.handle,
@@ -1366,6 +1380,7 @@ xrpc('get', 'app.humming.monetization.getCreator', async req => {
     viewer: { subscribed, expiresMs },
     profileLocked: gate.prefsOf(creator.address).locked,
     stats: { posts: mine.length, ...media },
+    feeBps: chainState.feeBps,
   }
 })
 
@@ -1485,10 +1500,11 @@ xrpc('post', 'app.humming.monetization.tip', async req => {
     e.status = 400
     throw e
   }
-  // 데모 가드레일: 0 < 팁 ≤ 10 HANEUL
-  if (!(amount > 0 && amount <= 10_000_000_000)) {
-    const e = new Error('Invalid tip amount')
+  // 가드레일: 0 < 팁 ≤ TIP_MAX (표시 단위 상한을 통화 데시멀로 환산한 값)
+  if (!(amount > 0 && amount <= TIP_MAX)) {
+    const e = new Error(`Invalid tip amount (must be between 0 and ${TIP_MAX_UNITS} ${COIN_SYMBOL})`)
     e.status = 400
+    e.errorName = 'InvalidRequest'
     throw e
   }
   // 팁은 온체인에 자연 멱등성이 없다 — 동일 (발신, 수신, 글, 금액)의 20초 창
@@ -1587,7 +1603,9 @@ xrpc('get', 'app.humming.creator.getEarnings', async req => {
   }
   totals.totalGeunhwa = totals.subscriptionGeunhwa + totals.tipGeunhwa + totals.purchaseGeunhwa
   const tier = gate.tierByCreator.get(viewer.address) || null
-  return { totals, items: items.slice(0, 30), tier, isCreator: !!tier }
+  // 플랫폼 수수료(bps)는 온체인 FeeConfig가 원본 — 앱 카피("Keep N% of what you earn")가
+  // 하드코딩된 숫자 대신 이 값을 그린다
+  return { totals, items: items.slice(0, 30), tier, isCreator: !!tier, feeBps: chainState.feeBps }
 })
 
 // --- app.humming.wallet: 지갑 패널 — "가입=지갑"을 UI에 드러내는 읽기 전용 뷰 ---
@@ -1660,6 +1678,9 @@ if (!IS_LOCALNET && !keypairFor(APP_WALLET)) {
 const server = app.listen(PORT, () => {
   console.log(`🚀 Humming XRPC 파사드: http://localhost:${PORT} (public: ${PUBLIC_URL})`)
   console.log(`   체인: ${RPC_URL} / 패키지: ${PKG.slice(0, 10)}…`)
+  console.log(
+    `   결제: ${COIN_SYMBOL} / 가스: ${SPONSOR_GAS ? '앱 지갑 스폰서' : `유저 지갑 (스타터 ${STARTER_GEUNHWA})`} / 팁 상한 ${TIP_MAX_UNITS} ${COIN_SYMBOL}`,
+  )
   if (!chainReady) console.log('   ⏳ 인덱스 복원 완료 전까지 XRPC는 503 (fail-closed)')
 })
 
@@ -1751,5 +1772,5 @@ try {
   console.warn(`   ⚠️ pending 화해 실패: ${e.message}`)
 }
 chainReady = true
-console.log(`   ⛓️  인덱스 복원 완료, 서빙 개방: ${stats()}`)
+console.log(`   ⛓️  인덱스 복원 완료, 서빙 개방: ${stats()} / 플랫폼 수수료 ${chainState.feeBps ?? '?'} bps`)
 startTailing()

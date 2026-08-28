@@ -38,9 +38,13 @@ Boot requirements for the production posture (boot is refused if unmet):
 - `HUMMING_KEYS_PASSPHRASE`: seals the custodial wallet key store with scrypt + AES-256-GCM at rest. A legacy plaintext store is migrated automatically on the first boot with the passphrase set. Losing the passphrase means losing the keys, so store it in a password manager.
 - `HUMMING_PUBLIC_URL`: the external address baked into signed media URLs (e.g. `https://api.humming.social`).
 - `HUMMING_APP_ORIGINS`: comma-separated list of allowed CORS origins (e.g. `https://humming.social`).
-- **An APP_WALLET signing key** must be present in the wallet key store to sign signups (name issuance plus starter gas).
+- **An APP_WALLET signing key** must be present in the wallet key store to sign signups (name issuance, starter gas, and sponsored gas).
 
-Signup funding: on a chain without a faucet, APP_WALLET handles name issuance and the starter gas grant in a **single PTB** at signup. Tune the starter amount with `HUMMING_STARTER_GEUNHWA` (default 200,000,000 = 0.2 HANEUL, capped at 10 HANEUL). The daily spend ceiling is the starter amount times `HUMMING_MAX_SIGNUPS_PER_DAY`.
+Signup funding: on a chain without a faucet, APP_WALLET handles name issuance and the starter gas grant in a **single PTB** at signup. Tune the starter amount with `HUMMING_STARTER_GEUNHWA` (default 200,000,000 = 0.2 of the gas coin, capped at 10). The daily spend ceiling is the starter amount times `HUMMING_MAX_SIGNUPS_PER_DAY`.
+
+Sponsored gas: on networks where `SPONSOR_GAS` is on (the default for the `sui-*` network map entries, override with `HUMMING_SPONSOR_GAS=0/1`), every user transaction is co-signed by APP_WALLET as the gas owner, so user wallets never hold the gas coin. Starter gas is therefore **not** granted on those networks, and a signup on a network without a name service touches the chain not at all. The payment coin (e.g. USDC) is separate from the gas coin; `app.humming.wallet.getInfo` reports the payment coin balance.
+
+Tips are capped per transaction at `HUMMING_TIP_MAX_UNITS` display units of the payment coin (default 100), converted with the coin's decimals so the cap means the same thing on 6- and 9-decimal coins. The platform fee shown to creators comes from the on-chain `FeeConfig` (`feeBps` in `app.humming.creator.getEarnings` / `app.humming.monetization.getCreator`), never from a hardcoded number.
 
 State backups: the facade snapshots its durable state (key store, accounts, JWT secret, indexer cursor) into a rotating local directory at boot, every 6 hours, and shortly after any key or account change. Tune with `HUMMING_BACKUP_DIR` (default `./backups`), `HUMMING_BACKUP_KEEP` (default 48), `HUMMING_BACKUP_INTERVAL_MS`, and set `HUMMING_BACKUP_CMD` to replicate each snapshot offsite (the command runs with `HUMMING_BACKUP_PATH` pointing at the new snapshot, e.g. an `rclone copy`). Each snapshot carries a `manifest.json` with per-file SHA-256 hashes; to restore, verify the hashes, copy the files back to the repo root, and restart.
 
