@@ -50,6 +50,11 @@ State backups: the facade snapshots its durable state (key store, accounts, JWT 
 
 Other environment variables: `PORT` (default 3025), `HUMMING_GRPC_URL` (defaults to `HUMMING_RPC_URL`; the full node serves gRPC multiplexed on the same port), `HUMMING_MEDIA_DIR`, `HUMMING_FAUCET_URL`, `HUMMING_TRUST_PROXY=1` (only behind a reverse proxy), and rate limit tuning: `HUMMING_LOGIN_IP_LIMIT` (20 per 5 min), `HUMMING_LOGIN_ACCT_LIMIT` (10 per 15 min), `HUMMING_SIGNUP_IP_LIMIT` (5 per hour), `HUMMING_MAX_SIGNUPS_PER_DAY` (200). Rate limits are effectively lifted on localnet so they never get in the way of E2E runs.
 
+## Profile media and search
+
+- **Avatar and banner**: `putRecord` on `app.bsky.actor.profile` accepts the `avatar` / `banner` blob references the app writes after `uploadBlob`. Only images the account itself uploaded are accepted (the upload's recorded owner must match), which keeps a paywalled image from being registered as someone's avatar and served publicly. Registered profile images are served from `GET /img/:cid` with immutable caching; every other CID on that route is 404. `getRecord` returns the blobs so the app's edit dialog preserves them.
+- **Search**: `app.bsky.actor.searchActors` / `searchActorsTypeahead` match handle and display name (handle prefix first, then display-name prefix, then substring; offset cursor). `app.bsky.feed.searchPosts` matches post text after gating for the viewer, so locked posts never surface. `app.bsky.actor.getSuggestions` returns creators (accounts with a subscription tier).
+
 ## Moderation
 
 The product allows adult content and moderates hard, so the serving layer has the four levers that policy needs:

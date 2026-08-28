@@ -28,6 +28,7 @@ import {
 } from './lib/pending.mjs'
 import { rateLimit } from './lib/ratelimit.mjs'
 import { clampLimit, pagePosts } from './lib/paginate.mjs'
+import { searchActors, searchPosts } from './lib/search.mjs'
 import { loadKeys, importFromCliKeystore, createWallet, removeWallet, keypairFor } from './lib/keys.mjs'
 import { bcs } from '@mysten/sui/bcs'
 import { grpcClient } from './lib/client.mjs'
@@ -74,6 +75,43 @@ const signMedia = (cid, exp) =>
 function mediaUrl(cid) {
   const exp = Date.now() + MEDIA_URL_TTL_MS
   return `${PUBLIC_URL}/media/${cid}?exp=${exp}&sig=${signMedia(cid, exp)}`
+}
+
+// ---- 프로필 미디어(아바타·배너): 공개 자원 ----
+// 게시물 미디어와 달리 프로필 이미지는 누구에게나 보여야 하고 앱 곳곳에 캐시되므로
+// 만료형 서명 URL이 맞지 않는다. 대신 "어느 계정의 아바타/배너로 등록된 CID"만 공개
+// 경로(/img/:cid)로 서빙한다 — 등록되지 않은 CID(유료 글의 이미지 등)는 이 경로로 안 나간다.
+const profileMediaCids = new Set()
+function rebuildProfileMediaCids() {
+  profileMediaCids.clear()
+  for (const a of ACCOUNTS) {
+    if (a.avatarCid) profileMediaCids.add(a.avatarCid)
+    if (a.bannerCid) profileMediaCids.add(a.bannerCid)
+  }
+}
+const publicMediaUrl = cid => (cid ? `${PUBLIC_URL}/img/${cid}` : undefined)
+function mediaMeta(cid) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(MEDIA_DIR, `${cid}.meta.json`), 'utf8'))
+  } catch {
+    return null
+  }
+}
+// 프로필 레코드의 blob 참조 → CID. 본인이 올린 이미지만 허용: 남의 (유료) CID를 아바타로
+// 등록해 공개 경로로 빼내는 우회를 막는다
+function profileBlobCid(acct, blob, field) {
+  if (blob == null) return null
+  const cid = blob?.ref?.$link
+  if (typeof cid !== 'string' || !/^[a-z2-7]+$/.test(cid)) httpError(400, 'InvalidRequest', `${field} must be a blob reference`)
+  const meta = mediaMeta(cid)
+  const uploadedByMe = meta && (meta.owner === acct.address || (meta.uploaders ?? []).includes(acct.address))
+  if (!uploadedByMe) httpError(400, 'InvalidRequest', `${field} must be an image you uploaded`)
+  if (!String(meta.mime).startsWith('image/')) httpError(400, 'InvalidRequest', `${field} must be an image`)
+  return cid
+}
+const blobRef = cid => {
+  const meta = cid ? mediaMeta(cid) : null
+  return meta ? { $type: 'blob', ref: { $link: cid }, mimeType: meta.mime, size: Number(meta.size) || 0 } : undefined
 }
 
 // content_uri 인코딩·디코딩(미디어 포인터·언어·셀프 라벨)은 lib/content.mjs — 단위 테스트 대상
@@ -369,6 +407,7 @@ function profileBasic(acct) {
     did: acct.did,
     handle: acct.handle,
     displayName: acct.displayName,
+    ...(acct.avatarCid && { avatar: publicMediaUrl(acct.avatarCid) }),
     labels: [],
     createdAt: '2026-07-10T00:00:00.000Z',
     viewer: { muted: false, blockedBy: false },
@@ -839,6 +878,7 @@ async function detailedProfile(actorParam) {
   return {
     ...profileBasic(acct),
     description: acct.description,
+    ...(acct.bannerCid && { banner: publicMediaUrl(acct.bannerCid) }),
     followersCount: acct.handle.startsWith('bob') ? 1 : 0,
     followsCount: acct.handle.startsWith('alice') ? 1 : 0,
     postsCount: posts.filter(p => p.author.did === acct.did).length,
@@ -987,6 +1027,8 @@ xrpc('get', 'com.atproto.repo.getRecord', async req => {
         $type: 'app.bsky.actor.profile',
         displayName: acct.displayName,
         description: acct.description,
+        ...(acct.avatarCid && { avatar: blobRef(acct.avatarCid) }),
+        ...(acct.bannerCid && { banner: blobRef(acct.bannerCid) }),
         createdAt: '2026-07-10T00:00:00.000Z',
       },
     }
@@ -1008,10 +1050,34 @@ xrpc('get', 'app.bsky.unspecced.getTaggedSuggestions', () => ({ suggestions: [] 
 xrpc('get', 'app.bsky.unspecced.getTrendingTopics', () => ({ topics: [], suggested: [] }))
 xrpc('get', 'app.bsky.unspecced.getPopularFeedGenerators', () => ({ feeds: [] }))
 xrpc('get', 'app.bsky.graph.getSuggestedFollowsByActor', () => ({ suggestions: [] }))
-xrpc('get', 'app.bsky.actor.getSuggestions', () => ({ actors: [] }))
-xrpc('get', 'app.bsky.actor.searchActors', () => ({ actors: [] }))
-xrpc('get', 'app.bsky.actor.searchActorsTypeahead', () => ({ actors: [] }))
-xrpc('get', 'app.bsky.feed.searchPosts', () => ({ posts: [] }))
+// --- 검색·발견: 파사드 원장 선형 스캔 (lib/search.mjs) ---
+const SEARCH_LIMIT = 25
+xrpc('get', 'app.bsky.actor.searchActors', async req => {
+  const limit = clampLimit(req.query.limit, SEARCH_LIMIT, 50)
+  const { items, cursor } = searchActors(ACCOUNTS, req.query.q ?? req.query.term, { limit, cursor: req.query.cursor })
+  const actors = await Promise.all(items.map(a => detailedProfile(a.did)))
+  return { actors, ...(cursor ? { cursor } : {}) }
+})
+xrpc('get', 'app.bsky.actor.searchActorsTypeahead', req => {
+  const limit = clampLimit(req.query.limit, 8, 20)
+  const { items } = searchActors(ACCOUNTS, req.query.q ?? req.query.term, { limit })
+  return { actors: items.map(a => profileBasic(a)) }
+})
+// 게시물 검색은 뷰어 기준 게이팅 뒤에 본문을 본다 — 잠긴 글은 검색에도 안 잡힌다
+xrpc('get', 'app.bsky.feed.searchPosts', async req => {
+  const limit = clampLimit(req.query.limit, SEARCH_LIMIT, 100)
+  const gated = await loadPostsFor(req)
+  const { items, cursor } = searchPosts(gated, req.query.q, { limit, cursor: req.query.cursor })
+  return { posts: items.map(p => p.post), ...(cursor ? { cursor } : {}) }
+})
+// 추천 = 티어가 있는 크리에이터 (탐색 화면·온보딩의 발견 경로). 본인은 제외
+xrpc('get', 'app.bsky.actor.getSuggestions', async req => {
+  const viewer = byDid(didFromAuth(req))
+  const gate = await loadGateState()
+  const limit = clampLimit(req.query.limit, SEARCH_LIMIT, 50)
+  const creators = ACCOUNTS.filter(a => a.did !== viewer?.did && gate.tierByCreator.has(a.address)).slice(0, limit)
+  return { actors: await Promise.all(creators.map(a => detailedProfile(a.did))) }
+})
 xrpc('get', 'chat.bsky.convo.getUnreadCounts', () => ({ convos: {} }))
 // at-uri는 authority 자리에 did 또는 handle 둘 다 올 수 있음 — 정규화해서 매칭
 function findPostByUri(posts, uri) {
@@ -1180,11 +1246,16 @@ app.post(
       // owner는 최초 업로더로 고정: 같은 파일을 나중에 올린 사람이 소유권을 뺏지 못한다
       let owner = acct.address
       let isNewBlob = true
+      // 같은 바이트를 올린 다른 계정들 — 소유권은 최초 업로더에 고정되지만, 바이트를
+      // 이미 가진 계정이 그 이미지를 자기 프로필에 쓰는 것은 막을 이유가 없다
+      let uploaders = []
       try {
         const prev = JSON.parse(fs.readFileSync(path.join(MEDIA_DIR, `${cid}.meta.json`), 'utf8'))
         if (prev.owner) owner = prev.owner
+        uploaders = Array.isArray(prev.uploaders) ? prev.uploaders : []
         isNewBlob = false // 동일 내용 재업로드: 저장량이 늘지 않으므로 쿼터에 다시 안 센다
       } catch {}
+      if (owner !== acct.address && !uploaders.includes(acct.address)) uploaders = [...uploaders, acct.address]
       const usage = mediaUsageMap()
       if (isNewBlob && (usage.get(owner) || 0) + bytes.length > MEDIA_QUOTA_BYTES)
         return res.status(400).json({
@@ -1193,7 +1264,11 @@ app.post(
         })
       mediaMetaOwners.set(cid, owner)
       writeFileAtomic(path.join(MEDIA_DIR, cid), bytes, { mode: 0o644 })
-      writeFileAtomic(path.join(MEDIA_DIR, `${cid}.meta.json`), JSON.stringify({ mime, size: bytes.length, owner }), { mode: 0o644 })
+      writeFileAtomic(
+        path.join(MEDIA_DIR, `${cid}.meta.json`),
+        JSON.stringify({ mime, size: bytes.length, owner, ...(uploaders.length && { uploaders }) }),
+        { mode: 0o644 },
+      )
       if (isNewBlob) usage.set(owner, (usage.get(owner) || 0) + bytes.length)
       console.log(`📦 업로드: ${cid.slice(0, 16)}… (${mime}, ${bytes.length}B) by ${acct.handle}`)
       res.json({ blob: { $type: 'blob', ref: { $link: cid }, mimeType: mime, size: bytes.length } })
@@ -1206,6 +1281,19 @@ app.post(
   },
 )
 implemented['com.atproto.repo.uploadBlob'] = true
+
+// 프로필 이미지 공개 경로 — 등록된 아바타/배너 CID만. 내용 주소라 영구 캐시 가능
+app.get('/img/:cid', (req, res) => {
+  const { cid } = req.params
+  if (!/^[a-z2-7]+$/.test(cid) || !profileMediaCids.has(cid)) return res.status(404).end()
+  const file = path.join(MEDIA_DIR, cid)
+  if (!fs.existsSync(file)) return res.status(404).end()
+  const meta = mediaMeta(cid)
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  res.setHeader('Content-Type', meta && isAllowedMediaMime(meta.mime) ? meta.mime : 'application/octet-stream')
+  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+  fs.createReadStream(file).pipe(res)
+})
 
 // 서명 URL 검증 후에만 원본 서빙 — URL 없이 CID만 알아도 접근 불가
 app.get('/media/:cid', (req, res) => {
@@ -1327,7 +1415,9 @@ xrpc('post', 'com.atproto.repo.deleteRecord', async req => {
 // 삭제된 글의 미디어 정리: 같은 CID를 아직 살아있는 다른 글이 쓰고 있으면 남긴다
 function releaseMediaOf(deleted, livePosts) {
   for (const m of deleted.media) {
-    const stillUsed = livePosts.some(p => p.postId !== deleted.postId && p.media.some(x => x.cid === m.cid))
+    const stillUsed =
+      profileMediaCids.has(m.cid) ||
+      livePosts.some(p => p.postId !== deleted.postId && p.media.some(x => x.cid === m.cid))
     if (stillUsed) continue
     const file = path.join(MEDIA_DIR, m.cid)
     try {
@@ -1352,6 +1442,10 @@ xrpc('post', 'com.atproto.repo.putRecord', async req => {
       httpError(400, 'InvalidRequest', `description must be at most ${MAX_DESCRIPTION_CHARS} characters`)
     if (record?.displayName) acct.displayName = record.displayName
     if (record?.description !== undefined) acct.description = record.description || ''
+    // 레코드는 프로필 전체라 avatar/banner 부재 = 제거 (앱의 upsertProfile이 기존 값을 합쳐 보낸다)
+    acct.avatarCid = profileBlobCid(acct, record?.avatar, 'avatar')
+    acct.bannerCid = profileBlobCid(acct, record?.banner, 'banner')
+    rebuildProfileMediaCids()
     if (acct.signup) persistAccounts()
   } else {
     console.log(`   (putRecord: ${collection} 미매핑 — 수용만)`)
@@ -1733,6 +1827,7 @@ app.all('/xrpc/:nsid', (req, res) => {
 
 // ---- 부팅: 키 로드 → 저널 리플레이+객체 재구성 → 서빙 시작 → 체크포인트 테일링 ----
 loadKeys()
+rebuildProfileMediaCids()
 startBackups()
 const imported = importFromCliKeystore([...ACCOUNTS.map(a => a.address), APP_WALLET])
 if (imported) console.log(`🔑 CLI 키스토어에서 계정 키 ${imported}개 임포트`)
