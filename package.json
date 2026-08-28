@@ -11,7 +11,7 @@
   "license": "Apache-2.0",
   "type": "commonjs",
   "dependencies": {
-    "@haneullabs/haneul": "^2.20.3",
+    "@mysten/sui": "^2.27.1",
     "cors": "^2.8.6",
     "express": "^5.2.1",
     "multiformats": "^14.0.4",

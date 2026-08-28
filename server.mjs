@@ -10,7 +10,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
-  NETWORK, RPC_URL, IS_LOCALNET, MAINNET_CHAIN_ID, PKG, NS_PKG, NS_OBJ, APP_WALLET, HANEUL_TYPE,
+  NETWORK, RPC_URL, IS_LOCALNET, EXPECTED_CHAIN_ID, PRODUCTION_CHAIN_IDS, PKG, NS_PKG, NS_OBJ, APP_WALLET, COIN_TYPE,
   DENY_RESERVED_TABLE, DENY_BLOCKED_TABLE,
 } from './lib/config.mjs'
 import { verifyJwt, sessionTokens, hashPassword, verifyPassword, DUMMY_HASH } from './lib/auth.mjs'
@@ -29,7 +29,7 @@ import {
 import { rateLimit } from './lib/ratelimit.mjs'
 import { clampLimit, pagePosts } from './lib/paginate.mjs'
 import { loadKeys, importFromCliKeystore, createWallet, removeWallet, keypairFor } from './lib/keys.mjs'
-import { bcs } from '@haneullabs/haneul/bcs'
+import { bcs } from '@mysten/sui/bcs'
 import { grpcClient } from './lib/client.mjs'
 import { chainIdentifier, getObjectJson, listAllDynamicFields } from './lib/grpc.mjs'
 import {
@@ -245,26 +245,26 @@ if (IS_LOCALNET) {
     console.error('   배포 환경이라면 HUMMING_ENV=production 을 설정하세요.')
     process.exit(1)
   }
-  if (chainId === MAINNET_CHAIN_ID) {
-    console.error(`❌ ${RPC_URL} 은 localhost지만 그 뒤의 체인은 메인넷(${chainId})입니다.`)
+  if (PRODUCTION_CHAIN_IDS.includes(chainId)) {
+    console.error(`❌ ${RPC_URL} 은 localhost지만 그 뒤의 체인은 프로덕션 메인넷(${chainId})입니다.`)
     console.error('   시드 계정·완화된 레이트리밋을 메인넷에 노출할 수 없어 부팅을 거부합니다.')
     console.error('   HUMMING_ENV=production 을 설정하고 배포 요건(README)을 채워 다시 시작하세요.')
     process.exit(1)
   }
 }
 
-// 역방향 검증: NETWORK=mainnet 설정이면 실체인도 메인넷이어야 한다 — 메인넷 주소
+// 역방향 검증: 기대 체인 ID가 있는 네트워크는 실체인과 일치해야 한다 — 메인넷 주소
 // 상수를 엉뚱한 체인에 대고 서빙하면 조용히 빈 인덱스로 뜨는 것을 부팅 실패로 바꾼다.
-if (NETWORK === 'mainnet') {
+if (EXPECTED_CHAIN_ID) {
   let chainId = null
   try {
     chainId = await chainIdentifier()
   } catch (e) {
-    console.error(`❌ 체인 식별자 확인 실패(${RPC_URL}): ${e.message} — 메인넷 RPC를 확인하세요.`)
+    console.error(`❌ 체인 식별자 확인 실패(${RPC_URL}): ${e.message} — RPC 주소를 확인하세요.`)
     process.exit(1)
   }
-  if (chainId !== MAINNET_CHAIN_ID) {
-    console.error(`❌ HUMMING_NETWORK=mainnet 인데 ${RPC_URL} 의 체인은 ${chainId} 입니다.`)
+  if (chainId !== EXPECTED_CHAIN_ID) {
+    console.error(`❌ HUMMING_NETWORK=${NETWORK} (기대 ${EXPECTED_CHAIN_ID}) 인데 ${RPC_URL} 의 체인은 ${chainId} 입니다.`)
     process.exit(1)
   }
 }
@@ -1592,7 +1592,7 @@ xrpc('get', 'app.humming.creator.getEarnings', async req => {
 xrpc('get', 'app.humming.wallet.getInfo', async req => {
   const viewer = requireAuthAcct(req)
   const [{ balance }, posts, gate] = await Promise.all([
-    grpcClient.getBalance({ owner: viewer.address, coinType: HANEUL_TYPE }),
+    grpcClient.getBalance({ owner: viewer.address, coinType: COIN_TYPE }),
     loadPosts(),
     loadGateState(),
   ])
