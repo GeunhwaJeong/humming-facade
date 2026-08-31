@@ -40,6 +40,8 @@ Boot requirements for the production posture (boot is refused if unmet):
 - `HUMMING_APP_ORIGINS`: comma-separated list of allowed CORS origins (e.g. `https://humming.social`).
 - **An APP_WALLET signing key** must be present in the wallet key store to sign signups (name issuance, starter gas, and sponsored gas).
 
+Bootstrapping a new deployment: after publishing the Move package, the shared `Feed` and its `RuleSet` are created once by APP_WALLET with `HUMMING_NETWORK=<network> node scripts/bootstrap-feed.mjs` (it reads the package, the app wallet, and the key store from `lib/config.mjs` and the network's key file, so it runs unchanged on every network in the map). It prints the `FEED` and `RULES` ids to paste into that network's block in `lib/config.mjs`, and refuses to run if the block already has a feed.
+
 Signup funding: on a chain without a faucet, APP_WALLET handles name issuance and the starter gas grant in a **single PTB** at signup. Tune the starter amount with `HUMMING_STARTER_GEUNHWA` (default 200,000,000 = 0.2 of the gas coin, capped at 10). The daily spend ceiling is the starter amount times `HUMMING_MAX_SIGNUPS_PER_DAY`.
 
 Sponsored gas: on networks where `SPONSOR_GAS` is on (the default for the `sui-*` network map entries, override with `HUMMING_SPONSOR_GAS=0/1`), every user transaction is co-signed by APP_WALLET as the gas owner, so user wallets never hold the gas coin. Starter gas is therefore **not** granted on those networks, and a signup on a network without a name service touches the chain not at all. The payment coin (e.g. USDC) is separate from the gas coin; `app.humming.wallet.getInfo` reports the payment coin balance.
