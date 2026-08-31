@@ -13,6 +13,10 @@ wallet-keys.json
 *.log
 accounts.mainnet.json
 wallet-keys.mainnet.json
+# 네트워크별 수탁 키·계정 파일 전부 (sui-testnet, sui-mainnet 등)은 이름 나열이 아니라
+# 패턴으로 막는다. 새 네트워크를 추가할 때 여기를 잊으면 `git add -A` 한 번에 유저 키가 샌다.
+wallet-keys.*.json
+accounts.*.json
 
 # 상태 백업 스냅샷 (런타임 생성)
 backups/
