@@ -29,6 +29,7 @@ import {
 import { rateLimit } from './lib/ratelimit.mjs'
 import { clampLimit, pagePosts } from './lib/paginate.mjs'
 import { searchActors, searchPosts } from './lib/search.mjs'
+import { mediaOwners } from './lib/media.mjs'
 import { loadKeys, importFromCliKeystore, createWallet, removeWallet, keypairFor } from './lib/keys.mjs'
 import { bcs } from '@mysten/sui/bcs'
 import { grpcClient } from './lib/client.mjs'
@@ -349,8 +350,10 @@ async function isDeniedName(label) {
 // strict=true: 실패를 그대로 던진다. 가입 화해처럼 "부재 확인"이 지갑 롤백의
 // 근거가 되는 곳은 실패와 부재를 구분해야 한다.
 const HANDLE_TLD = HANDLE_DOMAIN.split('.').pop()
-// 인증 배지 발급자 신원 — 핸들 도메인과 같은 TLD를 쓴다 (humming.haneul, humming.sui, …)
-const VERIFIER_DID = `did:web:humming.${HANDLE_TLD}`
+// 서비스 자체의 신원(DID) — 인증 배지 발급자·모더레이션(라벨러) 서비스가 이 이름으로 나간다.
+// 체인이 아니라 서비스 도메인에 묶인 값이라 네트워크 맵 어느 항목에서도 같다.
+const SERVICE_DID = process.env.HUMMING_SERVICE_DID || 'did:web:humming.social'
+const VERIFIER_DID = SERVICE_DID
 async function chainNameRecord(handle, { strict = false } = {}) {
   if (!NS_OBJ) return null // NS 미구성(SuiNS 통합 전) — 온체인 이름 원장 없음
   const labels = String(handle || '').toLowerCase().split('.').reverse()
@@ -509,15 +512,18 @@ const loadGateState = () => gateView()
 //   ① 업로드 시 meta.json에 기록된 owner (이 커밋 이후의 업로드, 근거가 가장 강함)
 //   ② 없으면 체인에서 그 CID가 처음 등장한 게시물의 작성자 (과거 업로드 백필 —
 //      공격자의 embed는 언제나 원본 게시물보다 나중의 post_id를 가지므로 안전)
-const mediaMetaOwners = new Map() // cid → address | null (meta.json 조회 캐시)
-function metaOwnerOf(cid) {
+// 같은 바이트를 올린 다른 계정(meta.uploaders)도 소유자로 본다: 바이트를 이미 가진
+// 계정이 자기 글에 그 이미지를 쓰는 것을 막을 이유가 없고, 막으면 두 번째 업로더의 글에서
+// 이미지가 조용히 사라진다(실측). 공개 CID 문자열만 아는 공격자는 여전히 uploaders에 못 든다.
+const mediaMetaOwners = new Map() // cid → address[] | null (meta.json 조회 캐시)
+function metaOwnersOf(cid) {
   if (mediaMetaOwners.has(cid)) return mediaMetaOwners.get(cid)
-  let owner = null
+  let owners = null
   try {
-    owner = JSON.parse(fs.readFileSync(path.join(MEDIA_DIR, `${cid}.meta.json`), 'utf8')).owner ?? null
+    owners = mediaOwners(JSON.parse(fs.readFileSync(path.join(MEDIA_DIR, `${cid}.meta.json`), 'utf8')))
   } catch {}
-  mediaMetaOwners.set(cid, owner)
-  return owner
+  mediaMetaOwners.set(cid, owners)
+  return owners
 }
 let cidOwnerVersion = -1
 let cidFirstAuthor = new Map() // cid → 첫 등장 게시물의 작성자 주소
@@ -535,7 +541,10 @@ function chainFirstAuthorOf(cid) {
   return cidFirstAuthor.get(cid)
 }
 const mediaOwnedBy = (item) =>
-  item.media.filter(m => (metaOwnerOf(m.cid) ?? chainFirstAuthorOf(m.cid)) === item.author.address)
+  item.media.filter(m => {
+    const owners = metaOwnersOf(m.cid)
+    return owners ? owners.includes(item.author.address) : chainFirstAuthorOf(m.cid) === item.author.address
+  })
 
 // 비열람 자격 뷰어에게는 본문 대신 잠금 정보를 내려줌.
 // post.humming 마커(구조화)로 humming-app이 네이티브 잠금 카드를 그리고,
@@ -712,7 +721,7 @@ function xrpc(method, nsid, handler) {
 
 // --- com.atproto.server ---
 xrpc('get', 'com.atproto.server.describeServer', () => ({
-  did: 'did:web:localhost',
+  did: SERVICE_DID,
   availableUserDomains: [`.${HANDLE_DOMAIN}`],
 }))
 
@@ -1017,7 +1026,36 @@ xrpc('get', 'app.bsky.graph.getFollowers', async req => ({
   subject: await detailedProfile(req.query.actor),
   followers: [],
 }))
-xrpc('get', 'app.bsky.labeler.getServices', () => ({ views: [] }))
+// 모더레이션 서비스(라벨러) — 앱의 신고 다이얼로그는 "이 신고 유형·대상을 지원하는 라벨러"가
+// 하나는 있어야 제출 단계로 넘어간다. 라벨 발행은 하지 않고(labelValues 비움), 신고 접수처로만
+// Humming 자신을 내건다. 앱은 이 DID를 기본 라벨러로 두고(HUMMING_LABELER_DID) 신고를 보낸다.
+// reasonTypes/subjectTypes/subjectCollections를 생략하면 앱이 "전부 지원"으로 해석한다.
+const LABELER_PROFILE = {
+  did: SERVICE_DID,
+  handle: `humming.${HANDLE_TLD}`,
+  displayName: 'Humming Moderation',
+  description: 'Reports go to the Humming team.',
+  labels: [],
+  createdAt: '2026-07-10T00:00:00.000Z',
+  viewer: { muted: false, blockedBy: false },
+}
+xrpc('get', 'app.bsky.labeler.getServices', async req => {
+  const dids = [].concat(req.query.dids || [])
+  if (!dids.includes(SERVICE_DID)) return { views: [] }
+  const detailed = String(req.query.detailed) === 'true'
+  const view = {
+    $type: detailed ? 'app.bsky.labeler.defs#labelerViewDetailed' : 'app.bsky.labeler.defs#labelerView',
+    uri: `at://${SERVICE_DID}/app.bsky.labeler.service/self`,
+    cid: await fakeCid(`${SERVICE_DID}/labeler`),
+    creator: LABELER_PROFILE,
+    likeCount: 0,
+    viewer: {},
+    indexedAt: '2026-07-10T00:00:00.000Z',
+    labels: [],
+    ...(detailed && { policies: { labelValues: [], labelValueDefinitions: [] } }),
+  }
+  return { views: [view] }
+})
 xrpc('get', 'com.atproto.repo.getRecord', async req => {
   const { repo, collection, rkey } = req.query
   const acct = byDid(repo) || byHandle(repo)
@@ -1065,13 +1103,17 @@ xrpc('get', 'app.bsky.actor.searchActorsTypeahead', req => {
   const { items } = searchActors(ACCOUNTS, req.query.q ?? req.query.term, { limit })
   return { actors: items.map(a => profileBasic(a)) }
 })
-// 게시물 검색은 뷰어 기준 게이팅 뒤에 본문을 본다 — 잠긴 글은 검색에도 안 잡힌다
-xrpc('get', 'app.bsky.feed.searchPosts', async req => {
+// 게시물 검색은 뷰어 기준 게이팅 뒤에 본문을 본다 — 잠긴 글은 검색에도 안 잡힌다.
+// V2(탐색 화면의 기본 "인기" 탭이 호출)는 파라미터 이름만 다르다(q → query); 정렬·필터
+// 옵션은 원장이 작아 무시하고 같은 결과를 준다.
+async function searchPostsHandler(req, q) {
   const limit = clampLimit(req.query.limit, SEARCH_LIMIT, 100)
   const gated = await loadPostsFor(req)
-  const { items, cursor } = searchPosts(gated, req.query.q, { limit, cursor: req.query.cursor })
+  const { items, cursor } = searchPosts(gated, q, { limit, cursor: req.query.cursor })
   return { posts: items.map(p => p.post), ...(cursor ? { cursor } : {}) }
-})
+}
+xrpc('get', 'app.bsky.feed.searchPosts', req => searchPostsHandler(req, req.query.q))
+xrpc('get', 'app.bsky.feed.searchPostsV2', req => searchPostsHandler(req, req.query.query ?? req.query.q))
 // 추천 = 티어가 있는 크리에이터 (탐색 화면·온보딩의 발견 경로). 본인은 제외
 xrpc('get', 'app.bsky.actor.getSuggestions', async req => {
   const viewer = byDid(didFromAuth(req))
@@ -1264,7 +1306,7 @@ app.post(
           error: 'QuotaExceeded',
           message: 'Media storage quota exceeded for this account',
         })
-      mediaMetaOwners.set(cid, owner)
+      mediaMetaOwners.set(cid, mediaOwners({ owner, uploaders }))
       writeFileAtomic(path.join(MEDIA_DIR, cid), bytes, { mode: 0o644 })
       writeFileAtomic(
         path.join(MEDIA_DIR, `${cid}.meta.json`),
