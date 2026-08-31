@@ -40,6 +40,8 @@ Boot requirements for the production posture (boot is refused if unmet):
 - `HUMMING_APP_ORIGINS`: comma-separated list of allowed CORS origins (e.g. `https://humming.social`).
 - **An APP_WALLET signing key** must be present in the wallet key store to sign signups (name issuance plus starter gas).
 
+Bootstrapping a new deployment: after publishing the Move package, the shared `Feed` and its `RuleSet` are created once by APP_WALLET with `HUMMING_NETWORK=<network> node scripts/bootstrap-feed.mjs` (it reads the package, the app wallet, and the key store from `lib/config.mjs` and the network's key file, so it runs unchanged on every network in the map). It prints the `FEED` and `RULES` ids to paste into that network's block in `lib/config.mjs`, and refuses to run if the block already has a feed.
+
 Signup funding: on a chain without a faucet, APP_WALLET handles name issuance and the starter gas grant in a **single PTB** at signup. Tune the starter amount with `HUMMING_STARTER_GEUNHWA` (default 200,000,000 = 0.2 HANEUL, capped at 10 HANEUL). The daily spend ceiling is the starter amount times `HUMMING_MAX_SIGNUPS_PER_DAY`.
 
 State backups: the facade snapshots its durable state (key store, accounts, JWT secret, indexer cursor) into a rotating local directory at boot, every 6 hours, and shortly after any key or account change. Tune with `HUMMING_BACKUP_DIR` (default `./backups`), `HUMMING_BACKUP_KEEP` (default 48), `HUMMING_BACKUP_INTERVAL_MS`, and set `HUMMING_BACKUP_CMD` to replicate each snapshot offsite (the command runs with `HUMMING_BACKUP_PATH` pointing at the new snapshot, e.g. an `rclone copy`). Each snapshot carries a `manifest.json` with per-file SHA-256 hashes; to restore, verify the hashes, copy the files back to the repo root, and restart.

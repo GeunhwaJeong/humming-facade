@@ -1626,8 +1626,9 @@ xrpc('post', 'app.humming.monetization.tip', async req => {
 })
 
 // 크리에이터 되기: 티어 생성(+선택적 프로필 잠금)을 본인 지갑 서명으로 온체인 확정.
-// KYC는 의도적 오프체인(신분증을 퍼블릭 체인에 못 올림) — 데모에서는 즉시 통과 스텁,
-// 통과 사실만 verified 배지로 반영. 실서비스에서는 외부 KYC 벤더 콜백이 이 자리에 들어옴.
+// 신원 인증(KYC)은 의도적 오프체인(신분증을 퍼블릭 체인에 못 올림)이고 아직 연결되지
+// 않았다. 검증 없이 verified 배지를 주면 배지가 아무 뜻도 없게 되므로, 외부 IDV 벤더의
+// 웹훅이 approved를 돌려줄 때만 acct.verified를 세우는 것이 이 자리에 들어온다.
 xrpc('post', 'app.humming.creator.becomeCreator', async req => {
   const viewer = requireAuthAcct(req)
   const price = Math.floor(Number(req.body.priceGeunhwa))
@@ -1653,11 +1654,8 @@ xrpc('post', 'app.humming.creator.becomeCreator', async req => {
     buildBecomeCreator(price, periodMs, `ipfs://humming-tier-${name}`, lockMode, viewer.address),
     'TierCreated',
   )
-  // KYC 스텁 통과 → 인증 크리에이터 배지
-  viewer.verified = true
-  persistAccounts()
   console.log(`🎨 크리에이터 전환: ${viewer.handle} (${price / 1e9} HANEUL/${periodDays}일, ${lockMode}) tx=${digest}`)
-  return { digest, tier: { priceGeunhwa: price, periodMs }, lockMode, verified: true }
+  return { digest, tier: { priceGeunhwa: price, periodMs }, lockMode, verified: !!viewer.verified }
 })
 
 // 내 수익: 온체인 이벤트 3종(Subscribed/TipSent/PostPurchased)을 크리에이터 기준으로 집계.
