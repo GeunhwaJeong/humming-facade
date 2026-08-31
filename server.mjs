@@ -349,6 +349,8 @@ async function isDeniedName(label) {
 // strict=true: 실패를 그대로 던진다. 가입 화해처럼 "부재 확인"이 지갑 롤백의
 // 근거가 되는 곳은 실패와 부재를 구분해야 한다.
 const HANDLE_TLD = HANDLE_DOMAIN.split('.').pop()
+// 인증 배지 발급자 신원 — 핸들 도메인과 같은 TLD를 쓴다 (humming.haneul, humming.sui, …)
+const VERIFIER_DID = `did:web:humming.${HANDLE_TLD}`
 async function chainNameRecord(handle, { strict = false } = {}) {
   if (!NS_OBJ) return null // NS 미구성(SuiNS 통합 전) — 온체인 이름 원장 없음
   const labels = String(handle || '').toLowerCase().split('.').reverse()
@@ -416,9 +418,9 @@ function profileBasic(acct) {
       verification: {
         verifications: [
           {
-            issuer: 'did:web:humming.haneul',
+            issuer: VERIFIER_DID,
             issuerDisplayName: 'Humming',
-            uri: `at://did:web:humming.haneul/app.bsky.graph.verification/${acct.handle.split('.')[0]}`,
+            uri: `at://${VERIFIER_DID}/app.bsky.graph.verification/${acct.handle.split('.')[0]}`,
             isValid: true,
             createdAt: '2026-07-10T00:00:00.000Z',
           },
@@ -577,7 +579,7 @@ function gatePosts(posts, viewerAcct, gate) {
         record: {
           ...item.post.record,
           text: paywallLocked
-            ? `🔒 Subscribers-only post\n\nSubscribe to @${item.author.handle} or buy this post (${priceH} HANEUL) to view it. Access is verified by the on-chain subscription state on Haneul.`
+            ? `🔒 Subscribers-only post\n\nSubscribe to @${item.author.handle} or buy this post (${priceH} ${COIN_SYMBOL}) to view it. Access is verified by the on-chain subscription state.`
             : `🔒 Posts from @${item.author.handle} are visible to subscribers only.`,
         },
       },
@@ -1896,7 +1898,7 @@ async function reconcileSignups() {
         handle: rec.handle,
         did: `did:web:${rec.handle}`,
         address: rec.address,
-        displayName: rec.handle.slice(0, -'.hum.haneul'.length),
+        displayName: rec.handle.slice(0, -(HANDLE_DOMAIN.length + 1)),
         description: 'New on Humming',
         passwordHash: rec.passwordHash,
         signup: true,
