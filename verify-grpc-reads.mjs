@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 // gRPC 읽기 경로 등가 검증 — 객체 재구성(readChainState)·체인ID·잔고·NS 이름
 // 조회를 두 전송으로 수행해 산출물이 같은지 비교한다. 읽기 전용.
 // JSON-RPC 레그는 구 구현의 사본이다 — 업스트림이 JSON-RPC를 실제로 제거한

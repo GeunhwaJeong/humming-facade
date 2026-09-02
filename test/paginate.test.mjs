@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 // 피드 커서 페이지네이션의 슬라이스 로직 검증.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

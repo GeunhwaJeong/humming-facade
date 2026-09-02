@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 // 결제 멱등층의 계약 검증: 인플라이트 공유, 성공 캐시, 실패 비캐시, 이중 키.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

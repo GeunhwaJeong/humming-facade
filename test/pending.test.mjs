@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 // 결제 pending 화해의 판정 로직 검증 (순수 함수, 체인 조회 결과를 주입).
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

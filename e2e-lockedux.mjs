@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 // E2E: OnlyFans-style locked UX — locked cards in timeline, fully locked
 // profile, inline subscribe CTA unlocking everything on-chain.
 import { chromium } from 'playwright'

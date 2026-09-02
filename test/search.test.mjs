@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 // 계정·게시물 검색의 순위·커서·잠금 제외.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

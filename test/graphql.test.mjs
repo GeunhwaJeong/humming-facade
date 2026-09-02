@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { toIndexerEvent, shouldBackfill, fetchGapEvents } from '../lib/graphql.mjs'

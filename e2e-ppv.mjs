@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 // E2E: PPV single-post purchase — erin (no subscriptions) buys one gated
 // post; it unlocks permanently while the subscription stays off.
 import { chromium } from 'playwright'

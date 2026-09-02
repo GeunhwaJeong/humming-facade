@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 // E2E: 가입 = 닉네임 = 지갑 — 앱 가입 화면(닉네임+비밀번호 단일 스텝) → createAccount
 // → 온체인 leaf 이름 + 자동 생성 지갑 검증.
 // Run: node e2e-signup.mjs

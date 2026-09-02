@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 // Probe: bob (non-subscriber) views carol's fully locked profile — expect the wall panel.
 import { chromium } from 'playwright'
 

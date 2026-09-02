@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 // Humming XRPC Facade — serves the Bluesky app from the Haneul chain.
 // The app speaks ATProto XRPC; we answer from humming contract events on localnet.
 // 쓰기 = SDK 인프로세스 서명(lib/chain), 읽기 = 저널·객체 재구성·체크포인트 테일링 인덱스(lib/indexer).

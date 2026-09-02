@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 // 신고 입력 검증과 운영자 숨김 목록의 영속·왕복.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

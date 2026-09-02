@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 // 배포 부트스트랩: 패키지 publish 뒤 한 번, APP_WALLET 서명으로 공유 Feed와 그 RuleSet을
 // 만든다. CLI는 feed::create의 반환 튜플(cap 2개)을 소비하지 못해 SDK 경유가 필요하다.
 //

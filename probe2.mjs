@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 // Quick probe: login as alice, dump what the home screen actually shows.
 import { chromium } from 'playwright'
 
