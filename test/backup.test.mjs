@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 // 백업 대상 목록 회귀 방지: 서버 디스크가 유일한 원본인 파일이 목록에서 빠지면
 // 디스크 손실 = 데이터 소실이다. 특히 이벤트 저널(과거 팁 이력의 유일한 원본).
 import { test } from 'node:test'

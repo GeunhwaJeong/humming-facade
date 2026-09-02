@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 // content_uri 인코딩·디코딩 — 미디어·언어·셀프 라벨 마커의 왕복과 하위 호환.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'

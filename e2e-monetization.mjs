@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 // E2E: humming-app native subscribe/tip buttons → facade → Haneul chain.
 // Run: node e2e-monetization.mjs
 import { chromium } from 'playwright'

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 // E2E: 지갑 사이드바 패널 — 진입점 → 홈(잔고·활동) → 주소 복사 → 받기(QR) →
 // 풀주소 복사 → 빈 지갑 상태(응답 목킹)까지 Uniswap 스타일 UI 전 구간 검증.
 import { chromium } from 'playwright'

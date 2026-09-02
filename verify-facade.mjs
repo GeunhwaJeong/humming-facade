@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 // 파사드 업그레이드 검증 — SDK 서명 경로 + 인덱서 게이팅 풀 플로우
 const F = 'http://localhost:3025/xrpc'
 const j = async (r) => {

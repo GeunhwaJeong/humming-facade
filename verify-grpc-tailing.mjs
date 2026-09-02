@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 // gRPC 테일링 등가 검증 — 같은 체크포인트 구간을 두 전송으로 읽어 이벤트가
 // 비트 단위로 같은지 비교한다. 읽기 전용이라 어느 네트워크에나 안전.
 //   ① 등가: JSON-RPC(getCheckpoints + multiGetTransactionBlocks, 구 테일링 경로)

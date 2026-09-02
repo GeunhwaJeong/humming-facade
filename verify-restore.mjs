@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 // 복원 dry-run — readChainState가 메인넷 실물 객체를 올바르게 파싱하는지 검증.
 // 읽기 전용: 어떤 tx도 보내지 않고 저널·커서 파일도 건드리지 않는다.
 // 사용: HUMMING_NETWORK=mainnet node verify-restore.mjs <accounts.json>

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 import { chromium } from 'playwright'
 const browser = await chromium.launch({ channel: 'chrome', headless: true })
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 } })

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 // E2E: 크리에이터 되기 — 팬(wasabi)이 사이드바 온보딩으로 크리에이터 전환 →
 // 컴포저 열람 설정으로 유료 글 발행 → 다른 계정(erin)에겐 잠김 → 내 수익 대시보드.
 // Run: node e2e-creator.mjs

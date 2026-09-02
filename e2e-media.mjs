@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 // E2E: media pipeline — composer image upload → on-chain pointer → render;
 // non-subscriber sees teaser without URLs; on-chain subscribe unlocks the image.
 import { chromium } from 'playwright'

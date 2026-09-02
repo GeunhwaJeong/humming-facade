@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Geunhwa Jeong
+// SPDX-License-Identifier: Apache-2.0
+
 // 입력 정책(비밀번호·MIME·상수시간 비교) 검증.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
