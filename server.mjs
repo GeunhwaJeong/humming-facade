@@ -14,7 +14,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   NETWORK, RPC_URL, IS_LOCALNET, EXPECTED_CHAIN_ID, PRODUCTION_CHAIN_IDS, PKG, NS_PKG, NS_SUB_PKG, NS_OBJ, APP_WALLET, COIN_TYPE, HANDLE_DOMAIN, COIN_UNIT, COIN_SYMBOL,
-  DENY_RESERVED_TABLE, DENY_BLOCKED_TABLE, SPONSOR_GAS,
+  DENY_RESERVED_TABLE, DENY_BLOCKED_TABLE, SPONSOR_GAS, GAS_COIN_TYPE,
 } from './lib/config.mjs'
 import { verifyJwt, sessionTokens, hashPassword, verifyPassword, DUMMY_HASH } from './lib/auth.mjs'
 import {
@@ -39,8 +39,7 @@ import { grpcClient } from './lib/client.mjs'
 import { chainIdentifier, getObjectJson, listAllDynamicFields } from './lib/grpc.mjs'
 import {
   execTx, faucet, buildStarterGas,
-  buildNewLeaf, buildCreatePost, buildDeletePost, buildSubscribe, buildPurchase, buildTip, buildBecomeCreator,
-} from './lib/chain.mjs'
+  buildNewLeaf, buildCreatePost, buildDeletePost, buildSubscribe, buildPurchase, buildTip, buildBecomeCreator, gasBalance } from './lib/chain.mjs'
 import { encodeContent, decodeContent } from './lib/content.mjs'
 import {
   checkReport, appendReport, listReports, isHidden, hiddenEntry, hidePost, unhidePost, listHidden,
@@ -642,6 +641,7 @@ app.get('/health', (req, res) => {
   res.status(chainReady ? 200 : 503).json({
     ready: chainReady,
     ...(chainReady && { events: stats(), ...t, degraded }),
+    ...(sponsorGas.checkedAt && { sponsorGas }),
   })
 })
 
@@ -1874,6 +1874,32 @@ app.all('/xrpc/:nsid', (req, res) => {
 loadKeys()
 rebuildProfileMediaCids()
 startBackups()
+
+// ---- 스폰서 가스 잔액 감시 ----
+// 앱 지갑이 전 유저 가스를 대납하는 네트워크에서는 이 잔액이 곧 서비스 가동 여부다.
+// 경보 임계 아래로 내려가면 로그에 경고를 남기고 /health에 실어 운영자가 채우게 한다.
+// 조회 실패는 삼킨다 — 감시 자체가 서비스를 흔들면 안 된다.
+const GAS_WARN_UNITS = BigInt(process.env.HUMMING_GAS_WARN_UNITS ?? 2_000_000_000) // 2 가스 코인
+const GAS_CHECK_MS = Number(process.env.HUMMING_GAS_CHECK_MS ?? 10 * 60_000)
+const sponsorGas = { balance: null, low: false, checkedAt: null }
+async function checkSponsorGas() {
+  try {
+    const bal = await gasBalance(APP_WALLET)
+    sponsorGas.balance = bal.toString()
+    sponsorGas.low = bal < GAS_WARN_UNITS
+    sponsorGas.checkedAt = new Date().toISOString()
+    const shown = `${(Number(bal) / 1e9).toFixed(3)} (${GAS_COIN_TYPE})`
+    if (sponsorGas.low)
+      console.warn(`⚠️  스폰서 가스 잔액 부족: ${APP_WALLET.slice(0, 10)}… = ${shown} < ${(Number(GAS_WARN_UNITS) / 1e9).toFixed(3)} — 앱 지갑을 충전하세요`)
+    else console.log(`⛽ 스폰서 가스 잔액: ${shown}`)
+  } catch (e) {
+    console.warn(`스폰서 가스 잔액 조회 실패 (무시): ${e.message}`)
+  }
+}
+if (SPONSOR_GAS && APP_WALLET && !IS_LOCALNET) {
+  checkSponsorGas()
+  setInterval(checkSponsorGas, GAS_CHECK_MS).unref()
+}
 const imported = importFromCliKeystore([...ACCOUNTS.map(a => a.address), APP_WALLET])
 if (imported) console.log(`🔑 CLI 키스토어에서 계정 키 ${imported}개 임포트`)
 // 앱 지갑 키가 없으면 가입(이름 발급·스타터 가스)이 전부 실패한다 —
