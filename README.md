@@ -1,14 +1,14 @@
 # humming-facade
 
-The XRPC facade server for Humming: a translation layer that connects a nearly unmodified Bluesky web app ([humming-app](https://github.com/GeunhwaJeong/humming-app)) to the Haneul blockchain.
+The XRPC facade server for Humming: a translation layer that connects a nearly unmodified Bluesky web app ([humming-app](https://github.com/GeunhwaJeong/humming-app)) to Sui.
 
 The app speaks standard ATProto XRPC. The chain speaks Move objects and events. This server sits in between:
 
 - **Reads**: converts on-chain posts (feed module records) into `getTimeline` / `getAuthorFeed` / `getPostThread` responses.
 - **Gating**: decides view entitlement server-side from on-chain state: subscriptions (`Subscribed`), single-post purchases (`PostPurchased`), and profile locks (`PrefsChanged`). Responses for non-entitled viewers have the body and media stripped entirely. Events are indexed with a checkpoint cursor (`lib/indexer.mjs`) and kept as in-memory state: live checkpoints arrive over a gRPC `SubscribeCheckpoints` stream, and gaps after a restart are backfilled with `GetCheckpoint` calls that fetch events only (`lib/grpc.mjs`). This keeps the read path off the JSON-RPC query APIs, which upstream is deprecating.
-- **Writes**: assembles post creation, subscriptions, tips, and single-post purchases as `@haneullabs/haneul` SDK Transactions and submits them with in-process signing (`lib/chain.mjs`). Submissions are serialized per signer wallet only; transactions from different wallets run in parallel.
+- **Writes**: assembles post creation, subscriptions, tips, and single-post purchases as `@mysten/sui` SDK Transactions and submits them with in-process signing (`lib/chain.mjs`). Submissions are serialized per signer wallet only; transactions from different wallets run in parallel.
 - **Transport**: every chain access, including reads, writes, object reconstruction, balances, and name lookups, goes over the full node's gRPC API. The runtime has no JSON-RPC dependency, so the upstream removal of the public JSON-RPC query APIs does not affect this server. Transport equivalence is checked by `verify-grpc-tailing.mjs` (events) and `verify-grpc-reads.mjs` (objects, balances, name records).
-- **Signup = handle = wallet**: a single `createAccount` call creates a wallet and issues an on-chain `name.hum.haneul` subname ([haneulns](https://github.com/GeunhwaJeong/haneulns-contracts) leaf record, gas sponsored by the server).
+- **Signup = handle = wallet**: a single `createAccount` call creates a wallet and assigns the `name.hum.sui` handle. On networks with a name service configured in `lib/config.mjs` (`NS_*` entries) the handle is also issued as an on-chain subname (leaf record, gas sponsored by the server); on the Sui mainnet map entry handle uniqueness is enforced by the facade ledger and signup touches the chain not at all.
 - **Media**: file bytes stay off-chain (`media/`); only the CID pointer goes on chain. HMAC-signed URLs are issued to entitled viewers only.
 
 ## Running
@@ -30,7 +30,7 @@ Boot is fail-closed: every XRPC endpoint returns 503 until the chain event backf
 
 Set `HUMMING_ENV=production` in deployed environments. It forces the production posture (no seed accounts, real rate limits, no faucet) regardless of the RPC URL. A non-localhost URL gets the same posture as well.
 
-The localnet posture only opens after the server verifies the actual chain identity at boot: if `127.0.0.1` turns out to point at a mainnet full node (chain `a0053d9e`), boot is refused. If the chain identity cannot be verified at all (chain down), the server refuses to boot into the localnet posture too.
+The localnet posture only opens after the server verifies the actual chain identity at boot: if `127.0.0.1` turns out to point at a production full node (Sui mainnet chain `35834a8a`), boot is refused. If the chain identity cannot be verified at all (chain down), the server refuses to boot into the localnet posture too.
 
 Boot requirements for the production posture (boot is refused if unmet):
 
@@ -38,7 +38,7 @@ Boot requirements for the production posture (boot is refused if unmet):
 - `HUMMING_KEYS_PASSPHRASE`: seals the custodial wallet key store with scrypt + AES-256-GCM at rest. A legacy plaintext store is migrated automatically on the first boot with the passphrase set. Losing the passphrase means losing the keys, so store it in a password manager.
 - `HUMMING_PUBLIC_URL`: the external address baked into signed media URLs (e.g. `https://api.humming.social`).
 - `HUMMING_APP_ORIGINS`: comma-separated list of allowed CORS origins (e.g. `https://humming.social`).
-- **An APP_WALLET signing key** must be present in the wallet key store to sign signups (name issuance, starter gas, and sponsored gas).
+- **An APP_WALLET signing key** must be present in the wallet key store to sign signups (name issuance where a name service is configured, starter gas, and sponsored gas).
 
 Bootstrapping a new deployment: after publishing the Move package, the shared `Feed` and its `RuleSet` are created once by APP_WALLET with `HUMMING_NETWORK=<network> node scripts/bootstrap-feed.mjs` (it reads the package, the app wallet, and the key store from `lib/config.mjs` and the network's key file, so it runs unchanged on every network in the map). It prints the `FEED` and `RULES` ids to paste into that network's block in `lib/config.mjs`, and refuses to run if the block already has a feed.
 
